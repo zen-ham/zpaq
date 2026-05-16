@@ -1,16 +1,16 @@
 name: Build wheels
 
+# The local updater.py flow builds the sdist + native (Windows cp311) wheel
+# and uploads them via twine before pushing the tag that fires this workflow.
+# This workflow's job is just to fill in the remaining wheels: Linux,
+# macOS, and the Windows Python versions that the maintainer's machine
+# doesn't have installed locally. `skip-existing: true` keeps the upload
+# step idempotent when files the local run already pushed are encountered.
+
 on:
   push:
-    branches: [master, main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
-    inputs:
-      upload:
-        description: "Upload to PyPI after build (only on tagged commits)"
-        required: false
-        default: "false"
 
 jobs:
   build_wheels:
@@ -37,29 +37,11 @@ jobs:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
 
-  build_sdist:
-    name: Source distribution
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Build sdist
-        run: |
-          python -m pip install --upgrade build
-          python -m build --sdist
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sdist
-          path: dist/*.tar.gz
-
   upload_pypi:
     name: Upload to PyPI
-    needs: [build_wheels, build_sdist]
+    needs: [build_wheels]
     runs-on: ubuntu-latest
-    # Only auto-upload on tagged commits, never on regular pushes / PRs.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -68,3 +50,4 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true

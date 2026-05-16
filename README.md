@@ -3,12 +3,12 @@
 
 Pure in-memory [ZPAQ](http://mattmahoney.net/dc/zpaq.html) compression for Python.
 
-Every other `pip install`-able ZPAQ package on PyPI either shells out to the `zpaq` executable (which forces temp files) or ships only an sdist (which forces every user to have a working C++ toolchain). This package is both:
+Every other `pip install`-able ZPAQ package on PyPI either shells out to the `zpaq` executable (which forces temp files). This package is:
 
 - A real pybind11 binding around `libzpaq` (the same library the official `zpaq` CLI uses), wrapping abstract `Reader`/`Writer` adapters that read from and write to `bytes` objects with no filesystem detour.
-- Distributed as **prebuilt wheels** for Windows, Linux and macOS across modern Python versions. Installing it never compiles anything.
+- Distributed as **prebuilt wheels** for Windows, Linux and macOS across modern Python versions. No C++ toolchain needed.
 
-On Windows, the wheel statically links the C and C++ runtimes so users do not need to install any "Visual C++ Redistributable" package - if Python runs, `zpaq` works.
+Usage:
 
 ```py
 import zpaq
@@ -62,3 +62,7 @@ License
 ---
 
 This package is released under the same terms as the underlying libzpaq sources: public domain. See `src/zpaq/vendor/COPYING`.
+
+---
+
+Not affiliated with Matt Mahoney. `libzpaq` was released into the public domain by its original author; this Python package wraps those sources and is an independent community project.
