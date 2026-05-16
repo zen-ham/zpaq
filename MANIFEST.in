@@ -1,0 +1,6 @@
+include README.md
+include pyproject.toml
+include setup.py
+recursive-include src/zpaq *.cpp *.h
+recursive-include src/zpaq/vendor *
+recursive-include tests *.py
