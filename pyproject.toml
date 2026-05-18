@@ -7,9 +7,12 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
-# Skip 32-bit, PyPy, and cp38 (EOL'd Oct 2024 and not shipped in the newer
-# manylinux_2_34 image we now use for the Linux wheels).
-skip = ["pp*", "*-win32", "*-manylinux_i686", "*-musllinux_i686", "cp38-*"]
+# Explicit build list - cp38 is EOL (Oct 2024) and not shipped in the
+# manylinux_2_34 image we use for Linux wheels, so skipping it via the
+# `skip` option still trips the cibuildwheel pre-flight env probe. Using
+# the inclusive `build` list avoids that.
+build = ["cp39-*", "cp310-*", "cp311-*", "cp312-*", "cp313-*"]
+skip = ["*-win32", "*-manylinux_i686", "*-musllinux_i686"]
 
 # Smoke-test every wheel after build to catch packaging / runtime bugs early.
 # faulthandler makes any C-level segfault during the test print a Python
