@@ -8,7 +8,7 @@ never requires a C++ toolchain.
 
 Public API:
     compress(data, level=5, threads=0, hints=False, verify=False, method=None) -> bytes
-    decompress(data, verify=False)                                             -> bytes
+    decompress(data, verify=False, threads=0)                                  -> bytes
     Error                                                                       -> raised on any libzpaq failure
 
 `level` is an integer in 0..5. 0 stores without compression; 5 is the

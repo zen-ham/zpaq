@@ -47,10 +47,19 @@ if sys.platform == "win32":
     # do not need any "VC++ redistributable" installed. Python itself already
     # ships vcruntime140.dll, and once we are static neither msvcp140.dll
     # nor vcruntime140_1.dll need to be present on the target machine.
+    #
+    # /arch:AVX2 lets the optimizer auto-vectorize where it can. AVX2 has been
+    # standard on Intel since Haswell (2013) and AMD since Excavator (2015);
+    # CPUs older than that don't get accelerated x86_64 wheels but can still
+    # fall back to the sdist build with the flag dropped.
     extra_compile_args += ["/MT", "/O2", "/EHsc", "/std:c++14"]
+    if _is_x86_64:
+        extra_compile_args += ["/arch:AVX2"]
     libraries = ["advapi32"]  # libzpaq uses wincrypt on Windows
 else:
     extra_compile_args += ["-O2", "-fvisibility=hidden"]
+    if _is_x86_64:
+        extra_compile_args += ["-mavx2"]
     # libzpaq's Windows-vs-unix preprocessor split keys off the `unix` macro.
     define_macros.append(("unix", "1"))
     libraries = []

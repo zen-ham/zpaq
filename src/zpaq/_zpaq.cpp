@@ -311,7 +311,78 @@ static const unsigned char kZpaqLocatorTag[13] = {
     0x8C, 0xB2, 0x28, 0xB0, 0xD3,
 };
 
-py::bytes decompress_bytes(py::buffer data, bool verify) {
+// Run the Decompresser over a contiguous chunk of one or more whole ZPAQ
+// blocks and accumulate the decoded data bytes into `out`. Handles both
+// the non-JIDAC fast path (segments written directly) and JIDAC archives
+// (metadata segments discarded, data-segment footers trimmed). Used both
+// by the single-threaded code path and by parallel-decompress workers.
+inline void decompress_chunk(const std::uint8_t* ptr,
+                             std::size_t size,
+                             BytesWriter& out,
+                             bool verify) {
+    BytesReader reader(ptr, size);
+    libzpaq::Decompresser d;
+    StringCollector fname, comment;
+    char sha1out[21];
+
+    d.setInput(&reader);
+    while (d.findBlock()) {
+        while (true) {
+            fname.clear();
+            if (!d.findFilename(&fname)) break;
+            comment.clear();
+            d.readComment(&comment);
+
+            const std::string& f = fname.str();
+            const bool is_jidac = f.size() >= 3 && f.compare(0, 3, "jDC") == 0;
+
+            if (is_jidac && is_jidac_metadata_segment(f)) {
+                // Index/hash/info segment - discard the payload.
+                d.setOutput(nullptr);
+                while (d.decompress()) {}
+                d.readSegmentEnd(sha1out);
+            } else if (is_jidac) {
+                // JIDAC 'd' (data) segment - decompress to a temp buffer,
+                // strip the trailing fragment-size footer, append.
+                BytesWriter segbuf;
+                libzpaq::SHA1 s2;
+                if (verify) d.setSHA1(&s2);
+                d.setOutput(&segbuf);
+                while (d.decompress()) {}
+                d.readSegmentEnd(sha1out);
+                if (verify && sha1out[0] == 1) {
+                    if (std::memcmp(s2.result(), sha1out + 1, 20) != 0) {
+                        throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
+                    }
+                }
+                auto& seg = segbuf.buffer();
+                const std::size_t trim = jidac_data_footer_size(
+                    seg.data(), seg.size());
+                const std::size_t keep = seg.size() - trim;
+                if (keep > 0) {
+                    out.buffer().insert(
+                        out.buffer().end(),
+                        seg.begin(),
+                        seg.begin() + static_cast<std::ptrdiff_t>(keep));
+                }
+            } else {
+                // Non-JIDAC fast path: real data straight to output buffer.
+                libzpaq::SHA1 sha1;
+                if (verify) d.setSHA1(&sha1);
+                d.setOutput(&out);
+                while (d.decompress()) {}
+                d.readSegmentEnd(sha1out);
+                if (verify && sha1out[0] == 1) {
+                    if (std::memcmp(sha1.result(), sha1out + 1, 20) != 0) {
+                        throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
+                    }
+                }
+            }
+        }
+    }
+}
+
+py::bytes decompress_bytes(py::buffer data, bool verify, int threads) {
     py::buffer_info info = data.request();
     if (info.ndim != 1 || info.itemsize != 1) {
         throw py::value_error("data must be a 1-D bytes-like buffer");
@@ -329,149 +400,86 @@ py::bytes decompress_bytes(py::buffer data, bool verify) {
             "(missing 13-byte locator tag at offset 0)");
     }
 
-    BytesReader reader(ptr, size);
+    // Locate every block boundary by scanning for the 13-byte locator tag.
+    // The tag opens every libzpaq-produced block (whether streaming output
+    // or JIDAC). It's 13 specific bytes - probability of a random run of 13
+    // bytes inside the compressed bitstream matching all of them is ~5e-32,
+    // so on real archives the scan finds exactly the block starts.
+    std::vector<std::size_t> block_starts;
+    block_starts.push_back(0);
+    const std::size_t tag_len = sizeof(kZpaqLocatorTag);
+    const std::uint8_t tag0 = kZpaqLocatorTag[0];
+    for (std::size_t i = 1; i + tag_len <= size; ++i) {
+        if (ptr[i] != tag0) continue;
+        if (std::memcmp(ptr + i, kZpaqLocatorTag, tag_len) == 0) {
+            block_starts.push_back(i);
+        }
+    }
+    block_starts.push_back(size);  // sentinel end
+    const int num_blocks = static_cast<int>(block_starts.size()) - 1;
+
+    // Resolve worker count and clamp to block count.
+    int t = threads;
+    if (t <= 0) {
+        unsigned hw = std::thread::hardware_concurrency();
+        t = hw > 0 ? static_cast<int>(hw) : 1;
+    }
+    if (t < 1) t = 1;
+    if (t > num_blocks) t = num_blocks;
+
     BytesWriter writer;
 
-    // Peek at the first segment's filename. If it isn't a JIDAC name we
-    // can take a much faster path: stream every block's output straight
-    // into `writer` without per-segment buffering, JIDAC filtering, or
-    // footer stripping. The decompressed bytes are the file contents
-    // verbatim. This is the common case for any data produced by our own
-    // compress() (or by any libzpaq::compress() user that didn't add
-    // explicit segment filenames).
+    if (t <= 1) {
+        py::gil_scoped_release release;
+        decompress_chunk(ptr, size, writer, verify);
+        auto& v = writer.buffer();
+        return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+    }
+
+    // Multi-threaded: partition the blocks evenly across workers, give
+    // each worker a contiguous byte range covering its blocks, run
+    // independent Decompressers in parallel, concatenate in order.
+    std::vector<std::vector<std::uint8_t>> outs(t);
+    std::vector<std::string> errors(t);
     {
         py::gil_scoped_release release;
-
-        libzpaq::Decompresser d;
-        StringCollector fname, comment;
-        char sha1out[21];
-
-        d.setInput(&reader);
-        if (!d.findBlock()) {
-            // No blocks - well-formed empty stream. Return empty.
-            return py::bytes(reinterpret_cast<const char*>(writer.buffer().data()),
-                             writer.buffer().size());
-        }
-        if (!d.findFilename(&fname)) {
-            // Block with no segments - nothing to extract.
-            return py::bytes(reinterpret_cast<const char*>(writer.buffer().data()),
-                             writer.buffer().size());
-        }
-        d.readComment(&comment);
-
-        const bool fast_path = !is_jidac_segment(fname.str());
-
-        if (fast_path) {
-            // Non-JIDAC stream: every segment is real file data, no
-            // metadata to filter, no footer to trim. Write straight to
-            // the output buffer. Repeat for all remaining segments and
-            // blocks - we already consumed the first segment's filename
-            // and comment, so we just need to decompress its body.
-            libzpaq::SHA1 sha1;
-            if (verify) d.setSHA1(&sha1);
-            d.setOutput(&writer);
-            while (d.decompress()) {}
-            d.readSegmentEnd(sha1out);
-            if (verify && sha1out[0] == 1) {
-                if (std::memcmp(sha1.result(), sha1out + 1, 20) != 0) {
-                    throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
-                }
+        const int blocks_per = num_blocks / t;
+        const int remainder = num_blocks % t;
+        auto worker = [&](int wid) {
+            try {
+                int my_start = wid * blocks_per + std::min(wid, remainder);
+                int my_count = blocks_per + (wid < remainder ? 1 : 0);
+                int my_end = my_start + my_count;
+                std::size_t off0 = block_starts[my_start];
+                std::size_t off1 = block_starts[my_end];
+                BytesWriter w;
+                decompress_chunk(ptr + off0, off1 - off0, w, verify);
+                outs[wid] = std::move(w.buffer());
+            } catch (const std::exception& e) {
+                errors[wid] = e.what();
+            } catch (...) {
+                errors[wid] = "unknown error in decompress worker";
             }
-            // Subsequent segments in the first block.
-            while (true) {
-                fname.clear();
-                if (!d.findFilename(&fname)) break;
-                comment.clear();
-                d.readComment(&comment);
-                libzpaq::SHA1 s2;
-                if (verify) d.setSHA1(&s2);
-                d.setOutput(&writer);
-                while (d.decompress()) {}
-                d.readSegmentEnd(sha1out);
-                if (verify && sha1out[0] == 1) {
-                    if (std::memcmp(s2.result(), sha1out + 1, 20) != 0) {
-                        throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
-                    }
-                }
-            }
-            // Subsequent blocks.
-            while (d.findBlock()) {
-                while (true) {
-                    fname.clear();
-                    if (!d.findFilename(&fname)) break;
-                    comment.clear();
-                    d.readComment(&comment);
-                    libzpaq::SHA1 s2;
-                    if (verify) d.setSHA1(&s2);
-                    d.setOutput(&writer);
-                    while (d.decompress()) {}
-                    d.readSegmentEnd(sha1out);
-                    if (verify && sha1out[0] == 1) {
-                        if (std::memcmp(s2.result(), sha1out + 1, 20) != 0) {
-                            throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
-                        }
-                    }
-                }
-            }
-        } else {
-            // JIDAC archive: filter metadata segments, strip data-segment
-            // footers, only keep actual file payload. This costs a per-
-            // segment intermediate buffer but is unavoidable for the
-            // journaling format.
-            auto process_segment = [&](const std::string& seg_fname) {
-                if (is_jidac_metadata_segment(seg_fname)) {
-                    d.setOutput(nullptr);
-                    while (d.decompress()) {}
-                    d.readSegmentEnd(sha1out);
-                } else {
-                    BytesWriter segbuf;
-                    libzpaq::SHA1 s2;
-                    if (verify) d.setSHA1(&s2);
-                    d.setOutput(&segbuf);
-                    while (d.decompress()) {}
-                    d.readSegmentEnd(sha1out);
-                    if (verify && sha1out[0] == 1) {
-                        if (std::memcmp(s2.result(), sha1out + 1, 20) != 0) {
-                            throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
-                        }
-                    }
-                    auto& seg = segbuf.buffer();
-                    const std::size_t trim = jidac_data_footer_size(
-                        seg.data(), seg.size());
-                    const std::size_t keep = seg.size() - trim;
-                    if (keep > 0) {
-                        writer.buffer().insert(
-                            writer.buffer().end(),
-                            seg.begin(),
-                            seg.begin() + static_cast<std::ptrdiff_t>(keep));
-                    }
-                }
-            };
-            // First segment (already have filename + comment in hand).
-            process_segment(fname.str());
-            // Remaining segments in first block.
-            while (true) {
-                fname.clear();
-                if (!d.findFilename(&fname)) break;
-                comment.clear();
-                d.readComment(&comment);
-                process_segment(fname.str());
-            }
-            // Remaining blocks.
-            while (d.findBlock()) {
-                while (true) {
-                    fname.clear();
-                    if (!d.findFilename(&fname)) break;
-                    comment.clear();
-                    d.readComment(&comment);
-                    process_segment(fname.str());
-                }
-            }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(t - 1);
+        for (int i = 1; i < t; ++i) workers.emplace_back(worker, i);
+        worker(0);
+        for (auto& w : workers) w.join();
+    }
+    for (int i = 0; i < t; ++i) {
+        if (!errors[i].empty()) {
+            throw zpaq_internal::ZpaqError(errors[i]);
         }
     }
 
-    auto& v = writer.buffer();
-    return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+    std::size_t total = 0;
+    for (auto& o : outs) total += o.size();
+    std::vector<std::uint8_t> result;
+    result.reserve(total);
+    for (auto& o : outs) result.insert(result.end(), o.begin(), o.end());
+    return py::bytes(reinterpret_cast<const char*>(result.data()),
+                     result.size());
 }
 
 }  // namespace zpaq_internal
@@ -524,10 +532,16 @@ method: optional raw libzpaq method string override (e.g. "x4,4,1" for
     m.def("decompress", &zpaq_internal::decompress_bytes,
           py::arg("data"),
           py::arg("verify") = false,
+          py::arg("threads") = 0,
           R"(Decompress a ZPAQ-compressed bytes-like object. Returns bytes.
 
 verify: if True, recompute the SHA-1 checksum of each segment and
   compare against the one stored in the archive. Raises zpaq.Error on
   mismatch. Default False for speed. Only meaningful if the archive
-  was created with verify=True (or by zpaq.exe, which defaults on).)");
+  was created with verify=True (or by zpaq.exe, which defaults on).
+threads: number of worker threads. 0 (default) auto-detects the host's
+  hardware concurrency and caps it by the number of independent ZPAQ
+  blocks in the input. 1 forces single-threaded. Multi-block archives
+  benefit; archives with a single block (e.g. small files compressed
+  at threads=1) are forced to single-threaded regardless.)");
 }

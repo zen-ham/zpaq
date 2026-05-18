@@ -29,6 +29,8 @@ On Windows, the wheel statically links the C and C++ runtimes so users don't nee
 Performance
 ---
 
+![benchmark](docs/benchmark.png)
+
 Speedup vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5):
 
 | workload | `zpaq.exe -m5` | best `zpaq.compress` | speedup |
@@ -77,15 +79,17 @@ Full benchmark by thread count below. CLI is the official `zpaq.exe` v7.15 invok
 **How the speedup is achieved.** `libzpaq`'s reference compiler emits an interpreter for the per-byte context-mixing predictor at compression levels 3-5. The official `zpaq.exe` on x86_64 ships with that interpreter replaced by a JIT that translates the predictor bytecode into native machine code at archive-open time. This package's x86_64 wheels enable the same JIT path **plus**:
 
 - multi-threaded block compression via `threads=N` (the official CLI tops out at 2 cores by default)
+- multi-threaded block decompression — we scan the archive for ZPAQ locator-tag block boundaries, dispatch each block to a worker, and concatenate. The official `libzpaq` API exposes only sequential decompress; doing it block-parallel makes our 125 MB decompress about 3× faster than `zpaq.exe x`.
 - skip-checksum-by-default (`verify=False`), since pure-data workflows rarely need the SHA-1 per block that `zpaq.exe` always computes
+- AVX2-enabled compile flags (auto-vectorization on x86_64; CPUs from 2013+ are covered, older fall back to the sdist build)
 - a libsais-backed suffix array constructor for level-3 BWT mode (Apache 2.0, several times faster than `libzpaq`'s vendored libdivsufsort-lite)
 - a faster decompress path for archives produced by `zpaq.compress` (avoids the JIDAC-aware per-segment buffering)
 
 Compress scales nearly linearly with thread count up to ~12 cores. Compression ratio drops slightly as threads increase (more block boundaries reduce per-block context size); the ratio for `t=1` matches or beats the CLI on every workload.
 
-Decompress is currently single-threaded for archives we produce — `libzpaq`'s decompress API doesn't expose a per-block worker model, and parallelizing it cleanly is on the v0.2 roadmap. On small/medium files decompress is competitive with or faster than the CLI; on the 125 MB sample the CLI's threaded extract pulls ahead.
+The remaining ratio gap on very large inputs (~1-2 percentage points at 100 MB) comes from `zpaq.exe`'s JIDAC fragment-level deduplication: it splits files into ~64 KB content-hashed chunks and stores only unique ones. We emit raw streaming blocks without dedup; dedup support is on the v0.2 roadmap.
 
-ARM / Apple Silicon wheels disable the x86-only JIT but still benefit from threading, libsais, and the fast decompress path.
+ARM / Apple Silicon wheels disable the x86-only JIT and AVX2 flags but still benefit from threading, libsais, and the fast decompress path.
 
 API
 ---
