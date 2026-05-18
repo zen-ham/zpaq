@@ -1,7 +1,7 @@
 `zpaq`
 ===
 
-Pure in-memory [ZPAQ](http://mattmahoney.net/dc/zpaq.html) compression for Python — **up to 5.9× faster than the official `zpaq` CLI**, byte-exact CLI-interoperable, multi-threaded, prebuilt wheels for every modern Python on Windows / Linux / macOS, zero C++ toolchain or runtime dependencies to install.
+Pure in-memory [ZPAQ](http://mattmahoney.net/dc/zpaq.html) compression for Python — **up to 5.9× faster than the official `zpaq` CLI** at the same ratio (with optional fragment-level deduplication), byte-exact CLI-interoperable in both directions, multi-threaded compress + decompress, prebuilt wheels for every modern Python on Windows / Linux / macOS, zero C++ toolchain or runtime dependencies to install.
 
 ```py
 import zpaq
@@ -14,6 +14,12 @@ By default `zpaq.compress(...)` auto-scales across all CPU cores (`threads=0`). 
 
 ```py
 blob = zpaq.compress(big_data, level=5, threads=1)   # max ratio, single-thread
+```
+
+For inputs with repeated content (logs, large text corpora, similar binaries, snapshots), pass `dedup=True` to get fragment-level deduplication — input is split into ~64 KB content-defined chunks, identical chunks are stored once. Matches what the official `zpaq a` CLI produces, so the output is fully `zpaq x` extractable:
+
+```py
+blob = zpaq.compress(repetitive_data, level=5, dedup=True)   # JIDAC archive
 ```
 
 Why this exists
@@ -87,7 +93,7 @@ Full benchmark by thread count below. CLI is the official `zpaq.exe` v7.15 invok
 
 Compress scales nearly linearly with thread count up to ~12 cores. Compression ratio drops slightly as threads increase (more block boundaries reduce per-block context size); the ratio for `t=1` matches or beats the CLI on every workload.
 
-The remaining ratio gap on very large inputs (~1-2 percentage points at 100 MB) comes from `zpaq.exe`'s JIDAC fragment-level deduplication: it splits files into ~64 KB content-hashed chunks and stores only unique ones. We emit raw streaming blocks without dedup; dedup support is on the v0.2 roadmap.
+Pass `dedup=True` to match `zpaq.exe`'s ratio on inputs with repeated content — fragment-level dedup splits the input into ~64 KB content-defined chunks and stores each unique chunk once. The output is a JIDAC archive that both this package's `decompress` and the official `zpaq x` CLI extract byte-exactly. Default behavior remains the raw streaming format (faster, slightly worse ratio on heavily-repetitive inputs).
 
 ARM / Apple Silicon wheels disable the x86-only JIT and AVX2 flags but still benefit from threading, libsais, and the fast decompress path.
 
@@ -111,6 +117,11 @@ zpaq.compress(
                              # extract, which is faster but won't catch corruption.
     method=None,             # Optional raw libzpaq method-string override (e.g. "x4,4,1"
                              # for custom predictor specs). Overrides level/hints when set.
+    dedup=False,             # If True, emit a JIDAC-format archive with fragment-level
+                             # deduplication. Input is content-defined-chunked into ~64KB
+                             # fragments, identical fragments are stored once. Output is
+                             # zpaq.exe-extractable. Improves ratio on repetitive data;
+                             # currently single-threaded encode.
 ) -> bytes
 
 zpaq.decompress(
@@ -157,11 +168,11 @@ When `zpaq.decompress` is fed a multi-file archive it returns the concatenated b
 Future work
 ---
 
-The current release leaves a few performance levers untouched; pull requests welcome:
+A few performance levers are still on the table; pull requests welcome:
 
 - **Profile-guided optimization (PGO).** Adding `/GENPROFILE` + `/USEPROFILE` to the MSVC build (and equivalents on gcc/clang) typically gains another 5-15%. Skipped here because cibuildwheel doesn't expose a clean two-stage build hook yet.
-- **AVX2 SIMD.** `libzpaq`'s predictor inner loop is small and serial; adding hand-written SIMD would require a deeper rewrite than a one-pass speedup.
-- **Parallel decompress.** `libzpaq`'s decompress API is currently single-threaded; a block-parallel decompressor would close the remaining gap on large archives.
+- **Hand-written SIMD in the predictor.** `/arch:AVX2` is enabled so the compiler auto-vectorizes where it can. The actual hot loop at compression levels 3-5 is the JIT-emitted predictor, which currently emits one x86 instruction at a time; rewriting the JIT to emit AVX2 mul-add chains for the MIX/ISSE components would be a real gain.
+- **Parallel JIDAC encode.** `dedup=True` is currently single-threaded; splitting the fragment-build pass across cores would speed up large dedup compresses.
 - **Per-segment archive API.** `zpaq.decompress` currently returns the concatenated bytes of every segment in a multi-file `zpaq a` archive. A future iterator API would let callers address individual files by name.
 
 License

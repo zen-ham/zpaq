@@ -14,11 +14,13 @@
 #include <cstring>
 #include <cstdio>
 #include <cctype>
+#include <array>
 #include <future>
 #include <mutex>
 #include <string>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -194,6 +196,315 @@ inline std::string method_with_hints(int level,
 // outweigh the parallelism gain.
 static constexpr std::size_t kMinChunkBytes = 64 * 1024;
 
+// =================== JIDAC dedup encoder ===================
+
+struct FragmentInfo {
+    unsigned char sha1[20];
+    std::uint32_t usize;
+    std::size_t offset;  // offset in input
+};
+
+struct Sha20Hash {
+    std::size_t operator()(const std::array<unsigned char, 20>& a) const noexcept {
+        std::size_t h = 0;
+        std::memcpy(&h, a.data(), sizeof(h));
+        return h;
+    }
+};
+struct Sha20Eq {
+    bool operator()(const std::array<unsigned char, 20>& a,
+                    const std::array<unsigned char, 20>& b) const noexcept {
+        return std::memcmp(a.data(), b.data(), 20) == 0;
+    }
+};
+
+// Content-defined chunking using zpaq's rolling-hash algorithm. Produces
+// fragments sized between MIN_FRAGMENT and MAX_FRAGMENT bytes. The same
+// inputs yield the same fragment boundaries as `zpaq.exe a`, so identical
+// content across files dedupes cleanly.
+inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
+                                             std::size_t size,
+                                             int fragment_param = 6) {
+    // For method "5" the blocksize is (1<<24)-4096 ~= 16 MB.
+    const unsigned blocksize = (1u << 24) - 4096;
+    const unsigned MAX_FRAGMENT =
+        (fragment_param > 19 || (8128u << fragment_param) > blocksize - 12)
+            ? blocksize - 12 : (8128u << fragment_param);
+    const unsigned MIN_FRAGMENT =
+        (fragment_param > 25 || (64u << fragment_param) > MAX_FRAGMENT)
+            ? MAX_FRAGMENT : (64u << fragment_param);
+
+    std::vector<FragmentInfo> frags;
+    if (size == 0) return frags;
+
+    std::size_t pos = 0;
+    while (pos < size) {
+        unsigned char o1[256] = {0};
+        int c1 = 0;
+        unsigned h = 0;
+        libzpaq::SHA1 sha1;
+        unsigned sz = 0;
+        std::size_t start = pos;
+
+        while (pos < size) {
+            unsigned char c = ptr[pos++];
+            if (c == o1[c1]) h = (h + c + 1) * 314159265u;
+            else            h = (h + c + 1) * 271828182u;
+            o1[c1] = c;
+            c1 = c;
+            sha1.put(c);
+            ++sz;
+            if (sz >= MAX_FRAGMENT) break;
+            if (fragment_param <= 22 && sz >= MIN_FRAGMENT &&
+                h < (1u << (22 - fragment_param))) break;
+        }
+
+        FragmentInfo f;
+        std::memcpy(f.sha1, sha1.result(), 20);
+        f.usize = sz;
+        f.offset = start;
+        frags.push_back(f);
+    }
+    return frags;
+}
+
+// Write a little-endian integer of N bytes through a libzpaq Writer.
+inline void put_le(libzpaq::Writer& w, std::uint64_t x, int n) {
+    for (int i = 0; i < n; ++i) {
+        w.put(static_cast<int>(x & 0xFF));
+        x >>= 8;
+    }
+}
+
+// Pad a non-negative integer to at least `n` decimal digits.
+inline std::string pad_digits(std::int64_t x, int n) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%0*lld", n, static_cast<long long>(x));
+    return std::string(buf);
+}
+
+// Build a JIDAC-format archive with fragment-level deduplication. The
+// archive contains:
+//   1. a 'c' header segment with the total compressed-data size
+//   2. one or more 'd' data segments, each containing concatenated unique
+//      fragments followed by a footer of fragment sizes
+//   3. one 'h' segment per 'd' block, listing fragment SHA-1 and size
+//   4. one 'i' segment with the virtual file's fragment-ID list
+// The result decompresses correctly with both `zpaq.decompress()` and the
+// official `zpaq x` CLI, but compresses better than raw streaming on
+// inputs with repeated content because identical fragments are stored once.
+py::bytes compress_dedup(py::buffer data, int level, py::object method_obj,
+                         bool hints) {
+    if (level < 0 || level > 5) {
+        throw py::value_error("level must be in 0..5");
+    }
+    py::buffer_info info = data.request();
+    if (info.ndim != 1 || info.itemsize != 1) {
+        throw py::value_error("data must be a 1-D bytes-like buffer");
+    }
+    const std::uint8_t* ptr = reinterpret_cast<const std::uint8_t*>(info.ptr);
+    const std::size_t size = static_cast<std::size_t>(info.size);
+    if (size == 0) return py::bytes("", 0);
+
+    // Resolve method string for the 'd' segments.
+    std::string method_str;
+    bool have_override = false;
+    if (!method_obj.is_none()) {
+        method_str = py::cast<std::string>(method_obj);
+        have_override = true;
+    }
+
+    // Fixed JIDAC date - any valid 14-digit YYYYMMDDHHMMSS works.
+    const std::int64_t date = 20240101000000LL;
+    auto seg_name = [&](char type, std::int64_t num) -> std::string {
+        return "jDC" + pad_digits(date, 14) + std::string(1, type) + pad_digits(num, 10);
+    };
+
+    BytesWriter out;
+
+    {
+        py::gil_scoped_release release;
+
+        // 1. Chunk the input.
+        auto fragments = chunk_input(ptr, size);
+
+        // 2. Dedup - track unique fragments, record per-input-fragment refs.
+        std::unordered_map<std::array<unsigned char, 20>, std::uint32_t,
+                           Sha20Hash, Sha20Eq> seen;
+        std::vector<FragmentInfo> unique_frags;
+        std::vector<std::uint32_t> file_refs;
+        unique_frags.reserve(fragments.size());
+        file_refs.reserve(fragments.size());
+        for (auto& f : fragments) {
+            std::array<unsigned char, 20> key;
+            std::memcpy(key.data(), f.sha1, 20);
+            auto it = seen.find(key);
+            if (it != seen.end()) {
+                file_refs.push_back(it->second);
+            } else {
+                std::uint32_t id =
+                    static_cast<std::uint32_t>(unique_frags.size()) + 1;
+                seen.emplace(key, id);
+                unique_frags.push_back(f);
+                file_refs.push_back(id);
+            }
+        }
+
+        // 3. Group unique fragments into 'd' blocks (~16 MB uncompressed each).
+        const std::size_t BLOCK_TARGET = 16 * 1024 * 1024;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> block_ranges;
+        {
+            std::uint32_t start_id = 1;
+            std::size_t accum = 0;
+            for (std::uint32_t i = 0; i < unique_frags.size(); ++i) {
+                accum += unique_frags[i].usize;
+                if (accum >= BLOCK_TARGET || i + 1 == unique_frags.size()) {
+                    block_ranges.emplace_back(start_id, i + 2);
+                    start_id = i + 2;
+                    accum = 0;
+                }
+            }
+        }
+
+        // 4. Header: reserve. The 'c' segment for an "0"-method block with a
+        // single 8-byte payload has a fixed compressed-size, so we can write
+        // a placeholder, compress the 'd' segments, then overwrite the
+        // header bytes in-place with the real cdata value.
+        BytesWriter placeholder_header;
+        {
+            libzpaq::StringBuffer hsb;
+            put_le(hsb, 0, 8);
+            libzpaq::compressBlock(&hsb, &placeholder_header, "0",
+                                   seg_name('c', static_cast<std::int64_t>(
+                                       unique_frags.size() + 1)).c_str(),
+                                   "jDC\x01", false);
+        }
+        const std::size_t header_size = placeholder_header.buffer().size();
+        out.write(reinterpret_cast<const char*>(placeholder_header.buffer().data()),
+                  static_cast<int>(header_size));
+
+        // 5. Compress each 'd' block.
+        std::vector<std::size_t> d_csizes;
+        d_csizes.reserve(block_ranges.size());
+        const std::size_t d_section_start = out.buffer().size();
+        for (auto& range : block_ranges) {
+            std::uint32_t start = range.first;
+            std::uint32_t end = range.second;
+            std::uint32_t n = end - start;
+
+            libzpaq::StringBuffer sb;
+            for (std::uint32_t i = start; i < end; ++i) {
+                const auto& f = unique_frags[i - 1];
+                sb.write(reinterpret_cast<const char*>(ptr + f.offset),
+                         static_cast<int>(f.usize));
+            }
+            for (std::uint32_t i = start; i < end; ++i) {
+                put_le(sb, unique_frags[i - 1].usize, 4);
+            }
+            put_le(sb, 0, 4);
+            put_le(sb, n, 4);
+
+            const std::uint8_t* frag0_ptr =
+                ptr + unique_frags[start - 1].offset;
+            const std::size_t block_usize = sb.size();
+            std::string this_method;
+            if (have_override) this_method = method_str;
+            else if (hints) this_method = method_with_hints(level, frag0_ptr,
+                                                            block_usize);
+            else this_method = std::string(1, static_cast<char>('0' + level));
+
+            BytesWriter d_sink;
+            libzpaq::compressBlock(&sb, &d_sink, this_method.c_str(),
+                                   seg_name('d', static_cast<std::int64_t>(
+                                       start)).c_str(),
+                                   "jDC\x01", false);
+            d_csizes.push_back(d_sink.buffer().size());
+            out.write(reinterpret_cast<const char*>(d_sink.buffer().data()),
+                      static_cast<int>(d_sink.buffer().size()));
+        }
+        const std::size_t cdata = out.buffer().size() - d_section_start;
+
+        // 6. Patch the header with the real cdata value.
+        BytesWriter real_header;
+        {
+            libzpaq::StringBuffer hsb;
+            put_le(hsb, cdata, 8);
+            libzpaq::compressBlock(&hsb, &real_header, "0",
+                                   seg_name('c', static_cast<std::int64_t>(
+                                       unique_frags.size() + 1)).c_str(),
+                                   "jDC\x01", false);
+        }
+        if (real_header.buffer().size() != header_size) {
+            throw zpaq_internal::ZpaqError(
+                "internal: JIDAC header size mismatch");
+        }
+        std::memcpy(out.buffer().data(), real_header.buffer().data(),
+                    header_size);
+
+        // 7. 'h' segments - one per 'd' block.
+        for (std::size_t b = 0; b < block_ranges.size(); ++b) {
+            std::uint32_t start = block_ranges[b].first;
+            std::uint32_t end = block_ranges[b].second;
+            libzpaq::StringBuffer is;
+            put_le(is, d_csizes[b], 4);
+            for (std::uint32_t i = start; i < end; ++i) {
+                const auto& f = unique_frags[i - 1];
+                is.write(reinterpret_cast<const char*>(f.sha1), 20);
+                put_le(is, f.usize, 4);
+            }
+            BytesWriter h_sink;
+            libzpaq::compressBlock(&is, &h_sink, "0",
+                                   seg_name('h', static_cast<std::int64_t>(
+                                       start)).c_str(),
+                                   "jDC\x01", false);
+            out.write(reinterpret_cast<const char*>(h_sink.buffer().data()),
+                      static_cast<int>(h_sink.buffer().size()));
+        }
+
+        // 8. 'i' segment - virtual file "data" with all refs.
+        // We use a fixed filename so `zpaq x` has somewhere to extract to.
+        // (Empty filenames are filtered by the CLI and result in 0 extracted
+        // files; the bytes-in / bytes-out caller doesn't see the name.)
+        {
+            libzpaq::StringBuffer is;
+            put_le(is, date, 8);
+            const char* vname = "data";
+            is.write(vname, static_cast<int>(std::strlen(vname)));
+            is.put(0);            // null terminator
+            put_le(is, 0, 4);     // no attributes
+            put_le(is, file_refs.size(), 4);
+            for (auto r : file_refs) put_le(is, r, 4);
+            BytesWriter i_sink;
+            libzpaq::compressBlock(&is, &i_sink, "1",
+                                   seg_name('i', 1).c_str(),
+                                   "jDC\x01", false);
+            out.write(reinterpret_cast<const char*>(i_sink.buffer().data()),
+                      static_cast<int>(i_sink.buffer().size()));
+        }
+    }
+
+    auto& v = out.buffer();
+    return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
+}
+
+// =================== streaming-format compress ===================
+// Forward declaration for the dispatcher below.
+py::bytes compress_bytes(py::buffer data, int level, int threads,
+                         bool hints, bool verify, py::object method_obj);
+
+// Public-facing dispatcher: streaming format by default, JIDAC dedup
+// archive when `dedup=True`. JIDAC mode ignores `threads` and `verify`
+// (parallel JIDAC encoding + segment-level SHA-1 are bigger features
+// that aren't in this release yet).
+py::bytes compress_dispatch(py::buffer data, int level, int threads,
+                            bool hints, bool verify, py::object method_obj,
+                            bool dedup) {
+    if (dedup) {
+        return compress_dedup(data, level, method_obj, hints);
+    }
+    return compress_bytes(data, level, threads, hints, verify, method_obj);
+}
+
 py::bytes compress_bytes(py::buffer data, int level, int threads,
                          bool hints, bool verify, py::object method_obj) {
     if (level < 0 || level > 5) {
@@ -311,15 +622,45 @@ static const unsigned char kZpaqLocatorTag[13] = {
     0x8C, 0xB2, 0x28, 0xB0, 0xD3,
 };
 
-// Run the Decompresser over a contiguous chunk of one or more whole ZPAQ
-// blocks and accumulate the decoded data bytes into `out`. Handles both
-// the non-JIDAC fast path (segments written directly) and JIDAC archives
-// (metadata segments discarded, data-segment footers trimmed). Used both
-// by the single-threaded code path and by parallel-decompress workers.
+// Holder for the JIDAC two-pass decompress: data segments populate
+// `frags` keyed by fragment ID; 'i' segments populate `refs` with the
+// per-file fragment-ID sequence. The final output is built by replaying
+// `refs` through `frags`.
+struct JidacBuilder {
+    std::unordered_map<std::uint32_t, std::vector<std::uint8_t>> frags;
+    std::vector<std::uint32_t> refs;
+    bool saw_refs = false;
+};
+
+inline std::uint32_t read_le32(const std::uint8_t* p) {
+    return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8)
+         | (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24);
+}
+
+// Parse the trailing 10-digit number out of a 28-byte JIDAC segment
+// filename "jDC<14-digit-date><type><10-digit-num>". Returns -1 on
+// malformed input.
+inline long parse_jidac_num(const std::string& fname) {
+    if (fname.size() != 28) return -1;
+    long n = 0;
+    for (std::size_t i = 18; i < 28; ++i) {
+        char c = fname[i];
+        if (c < '0' || c > '9') return -1;
+        n = n * 10 + (c - '0');
+    }
+    return n;
+}
+
+// Walk the Decompresser over a contiguous chunk of one or more whole
+// ZPAQ blocks. For non-JIDAC segments (or when `jb` is null) data is
+// written straight to `out`. For JIDAC archives `jb` collects per-ID
+// fragment bytes and the file's fragment-ID list; the caller assembles
+// the final output by replaying refs through frags.
 inline void decompress_chunk(const std::uint8_t* ptr,
                              std::size_t size,
                              BytesWriter& out,
-                             bool verify) {
+                             bool verify,
+                             JidacBuilder* jb) {
     BytesReader reader(ptr, size);
     libzpaq::Decompresser d;
     StringCollector fname, comment;
@@ -334,16 +675,11 @@ inline void decompress_chunk(const std::uint8_t* ptr,
             d.readComment(&comment);
 
             const std::string& f = fname.str();
-            const bool is_jidac = f.size() >= 3 && f.compare(0, 3, "jDC") == 0;
+            const bool is_jidac = f.size() == 28 && f.compare(0, 3, "jDC") == 0;
+            const char type = is_jidac ? f[17] : '\0';
 
-            if (is_jidac && is_jidac_metadata_segment(f)) {
-                // Index/hash/info segment - discard the payload.
-                d.setOutput(nullptr);
-                while (d.decompress()) {}
-                d.readSegmentEnd(sha1out);
-            } else if (is_jidac) {
-                // JIDAC 'd' (data) segment - decompress to a temp buffer,
-                // strip the trailing fragment-size footer, append.
+            if (is_jidac && type == 'd') {
+                long start_id = parse_jidac_num(f);
                 BytesWriter segbuf;
                 libzpaq::SHA1 s2;
                 if (verify) d.setSHA1(&s2);
@@ -355,16 +691,65 @@ inline void decompress_chunk(const std::uint8_t* ptr,
                         throw zpaq_internal::ZpaqError("SHA-1 checksum mismatch");
                     }
                 }
-                auto& seg = segbuf.buffer();
-                const std::size_t trim = jidac_data_footer_size(
-                    seg.data(), seg.size());
-                const std::size_t keep = seg.size() - trim;
-                if (keep > 0) {
-                    out.buffer().insert(
-                        out.buffer().end(),
-                        seg.begin(),
-                        seg.begin() + static_cast<std::ptrdiff_t>(keep));
+                auto& sb = segbuf.buffer();
+                const std::size_t footer = jidac_data_footer_size(
+                    sb.data(), sb.size());
+                if (footer == 0) continue;  // unrecognized layout - skip
+                const std::uint32_t N = read_le32(sb.data() + sb.size() - 4);
+                const std::uint8_t* sizes = sb.data() + sb.size() - footer;
+                std::size_t off = 0;
+                for (std::uint32_t i = 0; i < N; ++i) {
+                    const std::uint32_t fsize = read_le32(sizes + i * 4);
+                    if (off + fsize > sb.size() - footer) break;
+                    if (jb && start_id >= 0) {
+                        std::vector<std::uint8_t> frag(
+                            sb.begin() + off,
+                            sb.begin() + off + fsize);
+                        jb->frags[static_cast<std::uint32_t>(start_id) + i] =
+                            std::move(frag);
+                    } else {
+                        // No builder - fall back to storage-order concat.
+                        out.buffer().insert(out.buffer().end(),
+                            sb.begin() + off,
+                            sb.begin() + off + fsize);
+                    }
+                    off += fsize;
                 }
+            } else if (is_jidac && type == 'i') {
+                BytesWriter segbuf;
+                d.setOutput(&segbuf);
+                while (d.decompress()) {}
+                d.readSegmentEnd(sha1out);
+                if (!jb) continue;
+                // 'i' payload is a concatenation of file entries:
+                //   [date 8][filename null-terminated]
+                //   [attr_len 4][attrs]
+                //   [nfrags 4][frag_ids 4*nfrags]
+                auto& sb = segbuf.buffer();
+                std::size_t pos = 0;
+                while (pos + 8 <= sb.size()) {
+                    pos += 8;  // skip date
+                    while (pos < sb.size() && sb[pos] != 0) ++pos;
+                    if (pos >= sb.size()) break;
+                    ++pos;  // skip null
+                    if (pos + 4 > sb.size()) break;
+                    std::uint32_t attrlen = read_le32(sb.data() + pos);
+                    pos += 4 + attrlen;
+                    if (pos + 4 > sb.size()) break;
+                    std::uint32_t nfrags = read_le32(sb.data() + pos);
+                    pos += 4;
+                    if (pos + 4ull * nfrags > sb.size()) break;
+                    for (std::uint32_t i = 0; i < nfrags; ++i) {
+                        jb->refs.push_back(read_le32(sb.data() + pos));
+                        pos += 4;
+                    }
+                    jb->saw_refs = true;
+                }
+            } else if (is_jidac) {
+                // 'c' header / 'h' index / anything else - discard.
+                d.setOutput(nullptr);
+                while (d.decompress()) {}
+                d.readSegmentEnd(sha1out);
             } else {
                 // Non-JIDAC fast path: real data straight to output buffer.
                 libzpaq::SHA1 sha1;
@@ -428,58 +813,122 @@ py::bytes decompress_bytes(py::buffer data, bool verify, int threads) {
     if (t > num_blocks) t = num_blocks;
 
     BytesWriter writer;
+    JidacBuilder jb;
 
     if (t <= 1) {
         py::gil_scoped_release release;
-        decompress_chunk(ptr, size, writer, verify);
-        auto& v = writer.buffer();
-        return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
-    }
-
-    // Multi-threaded: partition the blocks evenly across workers, give
-    // each worker a contiguous byte range covering its blocks, run
-    // independent Decompressers in parallel, concatenate in order.
-    std::vector<std::vector<std::uint8_t>> outs(t);
-    std::vector<std::string> errors(t);
-    {
-        py::gil_scoped_release release;
-        const int blocks_per = num_blocks / t;
-        const int remainder = num_blocks % t;
-        auto worker = [&](int wid) {
-            try {
-                int my_start = wid * blocks_per + std::min(wid, remainder);
-                int my_count = blocks_per + (wid < remainder ? 1 : 0);
-                int my_end = my_start + my_count;
-                std::size_t off0 = block_starts[my_start];
-                std::size_t off1 = block_starts[my_end];
-                BytesWriter w;
-                decompress_chunk(ptr + off0, off1 - off0, w, verify);
-                outs[wid] = std::move(w.buffer());
-            } catch (const std::exception& e) {
-                errors[wid] = e.what();
-            } catch (...) {
-                errors[wid] = "unknown error in decompress worker";
+        decompress_chunk(ptr, size, writer, verify, &jb);
+    } else {
+        // Multi-threaded: partition the blocks evenly across workers, give
+        // each worker a contiguous byte range covering its blocks, run
+        // independent Decompressers in parallel. Each worker has its own
+        // JidacBuilder; we merge after.
+        std::vector<std::vector<std::uint8_t>> outs(t);
+        std::vector<JidacBuilder> local_jbs(t);
+        std::vector<std::string> errors(t);
+        {
+            py::gil_scoped_release release;
+            const int blocks_per = num_blocks / t;
+            const int remainder = num_blocks % t;
+            auto worker = [&](int wid) {
+                try {
+                    int my_start = wid * blocks_per + std::min(wid, remainder);
+                    int my_count = blocks_per + (wid < remainder ? 1 : 0);
+                    int my_end = my_start + my_count;
+                    std::size_t off0 = block_starts[my_start];
+                    std::size_t off1 = block_starts[my_end];
+                    BytesWriter w;
+                    decompress_chunk(ptr + off0, off1 - off0, w, verify,
+                                     &local_jbs[wid]);
+                    outs[wid] = std::move(w.buffer());
+                } catch (const std::exception& e) {
+                    errors[wid] = e.what();
+                } catch (...) {
+                    errors[wid] = "unknown error in decompress worker";
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(t - 1);
+            for (int i = 1; i < t; ++i) workers.emplace_back(worker, i);
+            worker(0);
+            for (auto& w : workers) w.join();
+        }
+        for (int i = 0; i < t; ++i) {
+            if (!errors[i].empty()) {
+                throw zpaq_internal::ZpaqError(errors[i]);
             }
-        };
-        std::vector<std::thread> workers;
-        workers.reserve(t - 1);
-        for (int i = 1; i < t; ++i) workers.emplace_back(worker, i);
-        worker(0);
-        for (auto& w : workers) w.join();
-    }
-    for (int i = 0; i < t; ++i) {
-        if (!errors[i].empty()) {
-            throw zpaq_internal::ZpaqError(errors[i]);
+        }
+
+        // Merge worker JidacBuilders + concatenate non-JIDAC writer outputs.
+        std::size_t non_jidac_total = 0;
+        for (auto& o : outs) non_jidac_total += o.size();
+        writer.buffer().reserve(non_jidac_total);
+        for (auto& o : outs) {
+            writer.buffer().insert(writer.buffer().end(), o.begin(), o.end());
+        }
+        for (auto& w_jb : local_jbs) {
+            for (auto& kv : w_jb.frags) {
+                jb.frags.emplace(kv.first, std::move(kv.second));
+            }
+            if (w_jb.saw_refs) {
+                jb.refs.insert(jb.refs.end(),
+                               w_jb.refs.begin(), w_jb.refs.end());
+                jb.saw_refs = true;
+            }
         }
     }
 
-    std::size_t total = 0;
-    for (auto& o : outs) total += o.size();
-    std::vector<std::uint8_t> result;
-    result.reserve(total);
-    for (auto& o : outs) result.insert(result.end(), o.begin(), o.end());
-    return py::bytes(reinterpret_cast<const char*>(result.data()),
-                     result.size());
+    // Assemble output. If 'i' segment(s) were seen we have the file's
+    // fragment-ID sequence and replay it. Otherwise fall back: JIDAC
+    // archive without 'i' -> emit fragments in ID order; pure stream
+    // -> writer already has the data.
+    if (jb.saw_refs) {
+        py::gil_scoped_release release;
+        std::size_t total = 0;
+        for (std::uint32_t r : jb.refs) {
+            auto it = jb.frags.find(r);
+            if (it == jb.frags.end()) {
+                throw zpaq_internal::ZpaqError(
+                    "JIDAC archive references unknown fragment id");
+            }
+            total += it->second.size();
+        }
+        std::vector<std::uint8_t> assembled;
+        assembled.reserve(total);
+        for (std::uint32_t r : jb.refs) {
+            const auto& frag = jb.frags[r];
+            assembled.insert(assembled.end(), frag.begin(), frag.end());
+        }
+        return py::bytes(reinterpret_cast<const char*>(assembled.data()),
+                         assembled.size());
+    }
+    if (!jb.frags.empty()) {
+        // JIDAC 'd' segments but no 'i' - emit fragments sorted by ID.
+        py::gil_scoped_release release;
+        std::vector<std::pair<std::uint32_t,
+                              const std::vector<std::uint8_t>*>> sorted;
+        sorted.reserve(jb.frags.size());
+        std::size_t total = 0;
+        for (auto& kv : jb.frags) {
+            sorted.emplace_back(kv.first, &kv.second);
+            total += kv.second.size();
+        }
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.first < b.first;
+                  });
+        std::vector<std::uint8_t> assembled;
+        assembled.reserve(total);
+        for (auto& p : sorted) {
+            assembled.insert(assembled.end(),
+                             p.second->begin(), p.second->end());
+        }
+        return py::bytes(reinterpret_cast<const char*>(assembled.data()),
+                         assembled.size());
+    }
+    // Non-JIDAC path - writer holds the answer.
+    auto& v = writer.buffer();
+    return py::bytes(reinterpret_cast<const char*>(v.data()), v.size());
 }
 
 }  // namespace zpaq_internal
@@ -498,13 +947,14 @@ PYBIND11_MODULE(_zpaq, m) {
     py::register_exception<zpaq_internal::ZpaqError>(m, "Error",
                                                        PyExc_RuntimeError);
 
-    m.def("compress", &zpaq_internal::compress_bytes,
+    m.def("compress", &zpaq_internal::compress_dispatch,
           py::arg("data"),
           py::arg("level") = 5,
           py::arg("threads") = 0,
           py::arg("hints") = false,
           py::arg("verify") = false,
           py::arg("method") = py::none(),
+          py::arg("dedup") = false,
           R"(Compress a bytes-like object using ZPAQ. Returns bytes.
 
 level: 0..5 - 0 stores without compression, 5 is the strongest.
@@ -527,7 +977,14 @@ verify: if True, libzpaq computes and stores a SHA-1 checksum per
   catch corruption either.
 method: optional raw libzpaq method string override (e.g. "x4,4,1" for
   custom predictor specs). When set, level/hints are ignored. See
-  libzpaq.h for the format; intended for power users.)");
+  libzpaq.h for the format; intended for power users.
+dedup: if True, emit a JIDAC-format archive with fragment-level
+  deduplication. Input is content-defined-chunked into ~64KB fragments
+  via rolling hash; identical fragments are stored once. The output
+  works with both this package's decompress() and the official zpaq.exe
+  CLI. Improves ratio on repetitive content (logs, large text corpora,
+  similar binaries). Currently ignores threads (single-threaded
+  JIDAC encode) and verify; expect more flexibility in a later release.)");
 
     m.def("decompress", &zpaq_internal::decompress_bytes,
           py::arg("data"),
