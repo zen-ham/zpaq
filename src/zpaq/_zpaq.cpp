@@ -493,17 +493,20 @@ PYBIND11_MODULE(_zpaq, m) {
     m.def("compress", &zpaq_internal::compress_bytes,
           py::arg("data"),
           py::arg("level") = 5,
-          py::arg("threads") = 1,
+          py::arg("threads") = 0,
           py::arg("hints") = false,
           py::arg("verify") = false,
           py::arg("method") = py::none(),
           R"(Compress a bytes-like object using ZPAQ. Returns bytes.
 
 level: 0..5 - 0 stores without compression, 5 is the strongest.
-threads: number of worker threads. 1 (default) is single-threaded;
-  >1 splits the input across N threads using compressBlock. 0 picks
-  the host's hardware concurrency. Inputs smaller than 64KB*threads
-  are forced to single-thread regardless of this value.
+threads: number of worker threads. 0 (default) auto-detects the host's
+  hardware concurrency and caps it by input size (64KB minimum chunk
+  per worker), so small inputs stay single-threaded and big inputs
+  use all cores. Set to 1 explicitly for deterministic / single-block
+  output - that gives ~0.5-3 percentage points better compression
+  ratio at the cost of throughput. Any positive integer pins the
+  thread count to exactly that value (still clamped by input size).
 hints: if True, pre-scan the input for text/exe signatures and order-1
   redundancy and pass them to libzpaq via the method string, matching
   what the zpaq CLI does. Default False. On pure text data it slightly

@@ -7,7 +7,7 @@ calls. Ships prebuilt wheels for Windows, Linux and macOS so installation
 never requires a C++ toolchain.
 
 Public API:
-    compress(data, level=5, threads=1, hints=False, verify=False, method=None) -> bytes
+    compress(data, level=5, threads=0, hints=False, verify=False, method=None) -> bytes
     decompress(data, verify=False)                                             -> bytes
     Error                                                                       -> raised on any libzpaq failure
 
