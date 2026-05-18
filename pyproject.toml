@@ -11,14 +11,17 @@ build-backend = "setuptools.build_meta"
 skip = ["pp*", "*-win32", "*-manylinux_i686", "*-musllinux_i686"]
 
 # Smoke-test every wheel after build to catch packaging / runtime bugs early.
+# faulthandler makes any C-level segfault during the test print a Python
+# stack trace before crashing, so we can identify the culprit test.
 test-requires = "pytest"
-test-command = "pytest -q {project}/tests"
+test-command = "python -X faulthandler -m pytest -q {project}/tests"
 
 [tool.cibuildwheel.linux]
-# manylinux_2_28 gives broad glibc compatibility while still having a modern
-# enough toolchain for C++14 without surprises.
-manylinux-x86_64-image = "manylinux_2_28"
-manylinux-aarch64-image = "manylinux_2_28"
+# manylinux_2_34 (AlmaLinux 9 / glibc 2.34) - newer than 2_28 because
+# libzpaq's JIT path crashes inside the 2_28 container on GH Actions
+# runners (most likely a kernel/glibc-2.28 mmap or seccomp interaction).
+manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
 
 [tool.cibuildwheel.macos]
 # Build a fat wheel that covers both Intel and Apple Silicon.

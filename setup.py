@@ -44,7 +44,19 @@ define_macros = [
     # libdivsufsort-lite that libzpaq vendors. Much faster on levels 3-5.
     ("ZPAQ_USE_LIBSAIS", "1"),
 ]
-_enable_jit = _is_x86_64 and sys.platform == "win32"
+# JIT on Windows x86_64 + Linux x86_64. macOS still off because its
+# hardened runtime requires the MAP_JIT entitlement, which we don't
+# currently set up. Linux uses the manylinux_2_34 build image
+# (AlmaLinux 9 / glibc 2.34) because the older 2_28 image crashed in
+# the JIT-emitted code path on GH Actions runners.
+_enable_jit = _is_x86_64 and sys.platform in ("win32", "linux")
+# Diagnostic override: ZPAQ_FORCE_JIT=1 / =0 overrides the default.
+import os as _os
+_force = _os.environ.get("ZPAQ_FORCE_JIT")
+if _force == "1" and _is_x86_64:
+    _enable_jit = True
+elif _force == "0":
+    _enable_jit = False
 if not _enable_jit:
     define_macros.append(("NOJIT", "1"))
 
