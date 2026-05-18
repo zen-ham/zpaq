@@ -689,11 +689,26 @@ py::bytes compress_bytes(py::buffer data, int level, int threads,
         override_method = py::cast<std::string>(method_obj);
         have_override = true;
     }
+    // Block-size byte. Matches zpaq.cpp:2184-2186: levels 2..9 get B=6
+    // (64 MB internal blocks), levels 0..1 get B=4 (16 MB). Bigger
+    // blocks at higher levels give the predictor more context per block,
+    // closing the ratio gap vs the CLI on multi-block inputs.
+    const char b_digit = (level >= 2) ? '6' : '4';
+
     auto pick_method = [&](const std::uint8_t* chunk_ptr,
                            std::size_t chunk_size) -> std::string {
         if (have_override) return override_method;
-        if (hints) return method_with_hints(level, chunk_ptr, chunk_size);
-        return std::string(1, static_cast<char>('0' + level));
+        if (hints) {
+            // method_with_hints returns "L,N2,N3"; splice the B digit
+            // in between L and the first comma so libzpaq sees "LB,N2,N3".
+            std::string m = method_with_hints(level, chunk_ptr, chunk_size);
+            if (m.size() >= 1 && std::isdigit(static_cast<unsigned char>(m[0]))) {
+                m.insert(m.begin() + 1, b_digit);
+            }
+            return m;
+        }
+        char buf[3] = {static_cast<char>('0' + level), b_digit, '\0'};
+        return std::string(buf);
     };
 
     std::vector<std::uint8_t> result;
