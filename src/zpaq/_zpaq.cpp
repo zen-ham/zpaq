@@ -423,8 +423,13 @@ py::bytes compress_dedup(py::buffer data, int level, py::object method_obj,
             }
         }
 
-        // 3. Group unique fragments into 'd' blocks (~16 MB uncompressed each).
-        const std::size_t BLOCK_TARGET = 16 * 1024 * 1024;
+        // 3. Group unique fragments into 'd' blocks. Cap at ~64 MB to
+        // match zpaq.cpp's blocksize for method "5" (it appends "6" to
+        // bare digit methods at zpaq.cpp:2185-2186, giving blocksize =
+        // (1<<26)-4096 ~= 64 MB). Using a smaller cap was the source of
+        // the ratio gap vs the CLI on inputs over ~16 MB - smaller
+        // blocks give the predictor less context to model.
+        const std::size_t BLOCK_TARGET = 64 * 1024 * 1024 - 4096;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> block_ranges;
         {
             std::uint32_t start_id = 1;

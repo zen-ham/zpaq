@@ -31,51 +31,42 @@ Performance
 
 ![benchmark](docs/benchmark.png)
 
-Benchmarks vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5). Both compress and decompress are parallel block-wise; `mem` wins both directions at every size from ~1 MB up:
+Benchmarks vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5). The `mem` binding wins both compress and decompress at every size, and `dedup=True` matches or beats the CLI on compression ratio at every scale:
 
-| workload | CLI comp | best mem comp | CLI decomp | best mem decomp |
-| --- | --- | --- | --- | --- |
-| 40 KB text | 0.14 s | 0.13 s (**1.1×**) | 0.14 s | 0.12 s (**1.2×**) |
-| 1 MB text | 2.28 s | 0.58 s (**3.9×**) | 2.23 s | 0.58 s (**3.8×**) |
-| 10 MB text | 24.1 s | 3.83 s (**6.3×**) | 25.1 s | 3.83 s (**6.6×**) |
-| 100 MB text | 252.5 s | 74.1 s (**3.4×**) | 250.7 s | 73.2 s (**3.4×**) |
+| workload | CLI comp | best mem comp | CLI decomp | best mem decomp | mem dedup ratio vs CLI |
+| --- | --- | --- | --- | --- | --- |
+| 1 MB text | 2.25 s | 0.56 s (**4.0×**) | 2.23 s | 0.64 s (**3.5×**) | **+0.013 pp** |
+| 10 MB text | 24.67 s | 4.36 s (**5.7×**) | 24.74 s | 4.29 s (**5.8×**) | **+0.001 pp** |
+| 100 MB text | 188.79 s | 44.86 s (**4.2×**) | 185.47 s | 44.91 s (**4.1×**) | **+0.078 pp** |
 
 Full breakdown by thread count below. CLI is the official `zpaq.exe` v7.15 invoked with `-m5` (its speeds already include the `-t0` default of two worker threads). `mem(t=N)` is `zpaq.compress(data, level=5, threads=N)`. Times in seconds; ratio is bytes-reduced over original.
-
-40 KB text:
-
-| algo | compress | decompress | ratio % |
-| --- | --- | --- | --- |
-| `zpaq.exe -m5` | 0.14 s | 0.14 s | 71.5 % |
-| `zpaq.compress(t=1)` | 0.13 s | 0.13 s | **73.5 %** |
-| `zpaq.compress(t=0)` | **0.13 s** | **0.12 s** | 73.5 % |
 
 1 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 2.28 s | 2.23 s | 80.0 % |
-| `zpaq.compress(t=1)` | 2.08 s | 2.12 s | 80.1 % |
-| `zpaq.compress(t=4)` | 0.70 s | 0.75 s | 79.3 % |
-| `zpaq.compress(t=12)` | **0.58 s** | **0.58 s** | 77.6 % |
+| `zpaq.exe -m5` | 2.25 s | 2.23 s | 79.963 % |
+| `zpaq.compress(t=1)` | 2.15 s | 2.21 s | 80.073 % |
+| `zpaq.compress(dedup=True)` | 2.18 s | 2.16 s | **79.976 %** |
+| `zpaq.compress(t=0)` (12 cores) | **0.56 s** | **0.64 s** | 77.547 % |
 
 10 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 24.14 s | 25.13 s | 84.2 % |
-| `zpaq.compress(t=1)` | 20.92 s | 21.50 s | 84.2 % |
-| `zpaq.compress(t=4)` | 6.72 s | 6.92 s | 82.8 % |
-| `zpaq.compress(t=12)` | **3.83 s** | **3.83 s** | 81.2 % |
+| `zpaq.exe -m5` | 24.67 s | 24.74 s | 84.161 % |
+| `zpaq.compress(t=1)` | 24.76 s | 25.15 s | 84.206 % |
+| `zpaq.compress(dedup=True)` | 24.24 s | 26.67 s | **84.162 %** |
+| `zpaq.compress(t=0)` (12 cores) | **4.36 s** | **4.29 s** | 81.213 % |
 
 100 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 252.5 s | 250.7 s | 86.7 % |
-| `zpaq.compress(t=1)` | 324.2 s | 85.9 s | 85.0 % |
-| `zpaq.compress(t=0)` (12 cores) | **74.1 s** | **73.2 s** | 84.5 % |
-| `zpaq.compress(dedup=True)` | 325.4 s | 120 s | **85.06 %** |
+| `zpaq.exe -m5` | 188.79 s | 185.47 s | 86.588 % |
+| `zpaq.compress(t=1)` | 248.63 s | 66.07 s | 85.059 % |
+| `zpaq.compress(dedup=True)` | 180.19 s | 184.52 s | **86.666 %** |
+| `zpaq.compress(t=0)` (12 cores) | **44.86 s** | **44.91 s** | 84.210 % |
 
 Why this is faster than the official CLI
 ---
