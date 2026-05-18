@@ -17,11 +17,13 @@ test-requires = "pytest"
 test-command = "python -X faulthandler -m pytest -q {project}/tests"
 
 [tool.cibuildwheel.linux]
-# manylinux_2_34 (AlmaLinux 9 / glibc 2.34) - newer than 2_28 because
-# libzpaq's JIT path crashes inside the 2_28 container on GH Actions
-# runners (most likely a kernel/glibc-2.28 mmap or seccomp interaction).
-manylinux-x86_64-image = "manylinux_2_34"
-manylinux-aarch64-image = "manylinux_2_34"
+# AlmaLinux 9 / glibc 2.34 (newer than the default manylinux_2_28
+# AlmaLinux 8 image). The default older image crashed inside the libzpaq
+# JIT-emitted code on GH Actions runners; the newer image fixes it.
+# Full image reference required because cibuildwheel 2.21 only knows the
+# short names up through manylinux_2_28.
+manylinux-x86_64-image = "quay.io/pypa/manylinux_2_34_x86_64:latest"
+manylinux-aarch64-image = "quay.io/pypa/manylinux_2_34_aarch64:latest"
 
 [tool.cibuildwheel.macos]
 # Build a fat wheel that covers both Intel and Apple Silicon.
