@@ -37,7 +37,7 @@ Benchmarks vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5).
 | --- | --- | --- | --- | --- | --- |
 | 1 MB text | 2.25 s | 0.56 s (**4.0×**) | 2.23 s | 0.64 s (**3.5×**) | **+0.013 pp** |
 | 10 MB text | 24.67 s | 4.36 s (**5.7×**) | 24.74 s | 4.29 s (**5.8×**) | **+0.001 pp** |
-| 100 MB text | 188.79 s | 44.86 s (**4.2×**) | 185.47 s | 44.91 s (**4.1×**) | **+0.078 pp** |
+| 100 MB text | 184.36 s | 55.73 s (**3.3×**) | 185.32 s | 56.02 s (**3.3×**) | **+0.078 pp** (dedup) / tie (t=1) |
 
 Full breakdown by thread count below. CLI is the official `zpaq.exe` v7.15 invoked with `-m5` (its speeds already include the `-t0` default of two worker threads). `mem(t=N)` is `zpaq.compress(data, level=5, threads=N)`. Times in seconds; ratio is bytes-reduced over original.
 
@@ -63,10 +63,10 @@ Full breakdown by thread count below. CLI is the official `zpaq.exe` v7.15 invok
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 188.79 s | 185.47 s | 86.588 % |
-| `zpaq.compress(t=1)` | 248.63 s | 66.07 s | 85.059 % |
+| `zpaq.exe -m5` | 184.36 s | 185.32 s | 86.74 % |
+| `zpaq.compress(t=1)` | 279.35 s | 173.33 s | 86.72 % |
 | `zpaq.compress(dedup=True)` | 180.19 s | 184.52 s | **86.666 %** |
-| `zpaq.compress(t=0)` (12 cores) | **44.86 s** | **44.91 s** | 84.210 % |
+| `zpaq.compress(t=0)` (12 cores) | **55.73 s** | **56.02 s** | 84.56 % |
 
 Why this is faster than the official CLI
 ---
