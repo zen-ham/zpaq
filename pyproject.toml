@@ -7,8 +7,9 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [tool.cibuildwheel]
-# Skip 32-bit and PyPy targets for the first release; can broaden later.
-skip = ["pp*", "*-win32", "*-manylinux_i686", "*-musllinux_i686"]
+# Skip 32-bit, PyPy, and cp38 (EOL'd Oct 2024 and not shipped in the newer
+# manylinux_2_34 image we now use for the Linux wheels).
+skip = ["pp*", "*-win32", "*-manylinux_i686", "*-musllinux_i686", "cp38-*"]
 
 # Smoke-test every wheel after build to catch packaging / runtime bugs early.
 # faulthandler makes any C-level segfault during the test print a Python

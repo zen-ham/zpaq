@@ -123,20 +123,20 @@ typedef struct LIBSAIS_UNBWT_CONTEXT
 #endif
 
 #if defined(HAS_BUILTIN_PREFETCH)
-    #define libsais_prefetchr(address) __builtin_prefetch((const void *)(address), 0, 3)
-    #define libsais_prefetchw(address) __builtin_prefetch((const void *)(address), 1, 3)
+    #define libsais_prefetchr(address) __builtin_prefetch((const char *)(address), 0, 3)
+    #define libsais_prefetchw(address) __builtin_prefetch((const char *)(address), 1, 3)
 #elif defined (_M_IX86) || defined (_M_AMD64)
     #include <intrin.h>
-    #define libsais_prefetchr(address) _mm_prefetch((const void *)(address), _MM_HINT_T0)
-    #define libsais_prefetchw(address) _m_prefetchw((const void *)(address))
+    #define libsais_prefetchr(address) _mm_prefetch((const char *)(address), _MM_HINT_T0)
+    #define libsais_prefetchw(address) _m_prefetchw((const char *)(address))
 #elif defined (_M_ARM)
     #include <intrin.h>
-    #define libsais_prefetchr(address) __prefetch((const void *)(address))
-    #define libsais_prefetchw(address) __prefetchw((const void *)(address))
+    #define libsais_prefetchr(address) __prefetch((const char *)(address))
+    #define libsais_prefetchw(address) __prefetchw((const char *)(address))
 #elif defined (_M_ARM64)
     #include <intrin.h>
-    #define libsais_prefetchr(address) __prefetch2((const void *)(address), 0)
-    #define libsais_prefetchw(address) __prefetch2((const void *)(address), 16)
+    #define libsais_prefetchr(address) __prefetch2((const char *)(address), 0)
+    #define libsais_prefetchw(address) __prefetch2((const char *)(address), 16)
 #else
     #error Your compiler, configuration or platform is not supported.
 #endif

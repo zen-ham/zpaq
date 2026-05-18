@@ -20,9 +20,12 @@ SOURCES = [
     # libsais (Apache 2.0, Ilya Grebnov) - linear-time suffix array
     # constructor used at levels 3-5 (BWT / LZ77-SA pre-pass). Several
     # times faster than the libdivsufsort-lite that libzpaq vendors
-    # internally. Compiled as C (setuptools selects the C compiler by
-    # file extension) so MSVC's _mm_prefetch overload set is happy.
-    f"{SRC}/vendor/libsais.c",
+    # internally. We rename the original libsais.c to libsais.cpp so it
+    # compiles uniformly through the C++ toolchain and avoids the mess
+    # of mixing -std=c++ flags into a .c source on macOS/Linux. The
+    # prefetch macros are patched (void* -> char* casts) so the C++
+    # compiler accepts them.
+    f"{SRC}/vendor/libsais.cpp",
 ]
 
 extra_compile_args = []
@@ -102,11 +105,6 @@ class build_ext_static(build_ext):
 
     def build_extensions(self):
         if sys.platform == "win32":
-            for ext in self.extensions:
-                ext.extra_compile_args = [
-                    a for a in (ext.extra_compile_args or [])
-                ]
-            # Remove distutils' default /MD from the compiler invocation.
             try:
                 self.compiler.compile_options = [
                     o for o in self.compiler.compile_options
