@@ -456,71 +456,117 @@ py::bytes compress_dedup(py::buffer data, int level, py::object method_obj,
         out.write(reinterpret_cast<const char*>(placeholder_header.buffer().data()),
                   static_cast<int>(header_size));
 
-        // 5. Compress each 'd' block.
-        std::vector<std::size_t> d_csizes;
-        d_csizes.reserve(block_ranges.size());
-        const std::size_t d_section_start = out.buffer().size();
-        for (auto& range : block_ranges) {
-            std::uint32_t start = range.first;
-            std::uint32_t end = range.second;
-            std::uint32_t n = end - start;
+        // 5. Compress each 'd' block, in parallel. Each block is an
+        // independent libzpaq invocation so they can run on separate
+        // threads; we collect outputs in a slot per block and write
+        // them back to `out` in order. Work-stealing via an atomic
+        // index so blocks of uneven size load-balance across cores.
+        std::vector<std::vector<std::uint8_t>> d_outputs(block_ranges.size());
+        std::vector<std::size_t> d_csizes(block_ranges.size(), 0);
+        std::vector<std::string> d_errors(block_ranges.size());
 
-            libzpaq::StringBuffer sb;
-            for (std::uint32_t i = start; i < end; ++i) {
-                const auto& f = unique_frags[i - 1];
-                sb.write(reinterpret_cast<const char*>(ptr + f.offset),
-                         static_cast<int>(f.usize));
-            }
-            for (std::uint32_t i = start; i < end; ++i) {
-                put_le(sb, unique_frags[i - 1].usize, 4);
-            }
-            put_le(sb, 0, 4);
-            put_le(sb, n, 4);
+        auto compress_one = [&](std::size_t bi) {
+            try {
+                auto& range = block_ranges[bi];
+                const std::uint32_t start = range.first;
+                const std::uint32_t end = range.second;
+                const std::uint32_t n = end - start;
 
-            // Build per-block method string. When `hints` is on we
-            // emit "L,N2,N3" using the CLI-compatible per-fragment
-            // scores collected during chunk_input (mirrors what
-            // zpaq.cpp does at libzpaq.cpp:2502-2504). Without this
-            // step the ratio drops ~1.7pp at multi-block scale, so
-            // dedup mode defaults `hints=True`.
-            std::string this_method;
-            if (have_override) {
-                this_method = method_str;
-            } else if (hints) {
-                std::uint64_t redundancy = 0;
-                std::uint32_t exe_count = 0;
-                std::uint32_t text_count = 0;
-                std::uint32_t frag_count = n;
+                libzpaq::StringBuffer sb;
                 for (std::uint32_t i = start; i < end; ++i) {
                     const auto& f = unique_frags[i - 1];
-                    redundancy += f.hits;
-                    if (f.exe1) exe_count += 4;
-                    if (f.text1) text_count += 2;
+                    sb.write(reinterpret_cast<const char*>(ptr + f.offset),
+                             static_cast<int>(f.usize));
                 }
-                const std::size_t block_usize_no_footer =
-                    sb.size() - (4ull * n + 8);
-                std::uint64_t denom =
-                    static_cast<std::uint64_t>(block_usize_no_footer) / 256 + 1;
-                std::uint64_t n2 = redundancy / denom;
-                if (n2 > 255) n2 = 255;
-                int n3 = ((exe_count > frag_count) ? 2 : 0) +
-                         ((text_count > frag_count) ? 1 : 0);
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "%d,%u,%d",
-                              level, static_cast<unsigned>(n2), n3);
-                this_method = std::string(buf);
-            } else {
-                this_method = std::string(1, static_cast<char>('0' + level));
-            }
+                for (std::uint32_t i = start; i < end; ++i) {
+                    put_le(sb, unique_frags[i - 1].usize, 4);
+                }
+                put_le(sb, 0, 4);
+                put_le(sb, n, 4);
 
-            BytesWriter d_sink;
-            libzpaq::compressBlock(&sb, &d_sink, this_method.c_str(),
-                                   seg_name('d', static_cast<std::int64_t>(
-                                       start)).c_str(),
-                                   "jDC\x01", false);
-            d_csizes.push_back(d_sink.buffer().size());
-            out.write(reinterpret_cast<const char*>(d_sink.buffer().data()),
-                      static_cast<int>(d_sink.buffer().size()));
+                std::string this_method;
+                if (have_override) {
+                    this_method = method_str;
+                } else if (hints) {
+                    std::uint64_t redundancy = 0;
+                    std::uint32_t exe_count = 0;
+                    std::uint32_t text_count = 0;
+                    std::uint32_t frag_count = n;
+                    for (std::uint32_t i = start; i < end; ++i) {
+                        const auto& f = unique_frags[i - 1];
+                        redundancy += f.hits;
+                        if (f.exe1) exe_count += 4;
+                        if (f.text1) text_count += 2;
+                    }
+                    const std::size_t block_usize_no_footer =
+                        sb.size() - (4ull * n + 8);
+                    std::uint64_t denom =
+                        static_cast<std::uint64_t>(block_usize_no_footer) / 256 + 1;
+                    std::uint64_t n2 = redundancy / denom;
+                    if (n2 > 255) n2 = 255;
+                    int n3 = ((exe_count > frag_count) ? 2 : 0) +
+                             ((text_count > frag_count) ? 1 : 0);
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%d,%u,%d",
+                                  level, static_cast<unsigned>(n2), n3);
+                    this_method = std::string(buf);
+                } else {
+                    this_method = std::string(1, static_cast<char>('0' + level));
+                }
+
+                BytesWriter d_sink;
+                libzpaq::compressBlock(&sb, &d_sink, this_method.c_str(),
+                                       seg_name('d', static_cast<std::int64_t>(
+                                           start)).c_str(),
+                                       "jDC\x01", false);
+                d_csizes[bi] = d_sink.buffer().size();
+                d_outputs[bi] = std::move(d_sink.buffer());
+            } catch (const std::exception& e) {
+                d_errors[bi] = e.what();
+            } catch (...) {
+                d_errors[bi] = "unknown error in d-block worker";
+            }
+        };
+
+        int nworkers = static_cast<int>(std::thread::hardware_concurrency());
+        if (nworkers < 1) nworkers = 1;
+        if (static_cast<std::size_t>(nworkers) > block_ranges.size()) {
+            nworkers = static_cast<int>(block_ranges.size());
+        }
+
+        if (nworkers <= 1 || block_ranges.size() <= 1) {
+            for (std::size_t bi = 0; bi < block_ranges.size(); ++bi) {
+                compress_one(bi);
+            }
+        } else {
+            std::atomic<std::size_t> next_block{0};
+            auto worker_loop = [&]() {
+                while (true) {
+                    std::size_t bi = next_block.fetch_add(1,
+                        std::memory_order_relaxed);
+                    if (bi >= block_ranges.size()) break;
+                    compress_one(bi);
+                }
+            };
+            std::vector<std::thread> workers;
+            workers.reserve(nworkers - 1);
+            for (int i = 0; i < nworkers - 1; ++i) {
+                workers.emplace_back(worker_loop);
+            }
+            worker_loop();
+            for (auto& w : workers) w.join();
+        }
+
+        for (auto& e : d_errors) {
+            if (!e.empty()) {
+                throw zpaq_internal::ZpaqError(e);
+            }
+        }
+
+        const std::size_t d_section_start = out.buffer().size();
+        for (auto& d_out : d_outputs) {
+            out.write(reinterpret_cast<const char*>(d_out.data()),
+                      static_cast<int>(d_out.size()));
         }
         const std::size_t cdata = out.buffer().size() - d_section_start;
 

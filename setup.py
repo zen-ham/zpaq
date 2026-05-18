@@ -63,27 +63,50 @@ elif _force == "0":
 if not _enable_jit:
     define_macros.append(("NOJIT", "1"))
 
+# Profile-guided optimization. Two-phase build:
+#   phase 1 (instrument): build instrumented .pyd, run scripts/pgo_workload.py
+#   phase 2 (use):        recompile reading the profile data
+# Controlled by ZPAQ_PGO_PHASE env var. Unset = normal non-PGO build.
+# Profile data lives under build/pgo/ (relative to the package source dir)
+# so it persists across the two builds within a single cibuildwheel cell.
+_pgo_phase = _os.environ.get("ZPAQ_PGO_PHASE")
+_pgo_dir = _os.environ.get("ZPAQ_PGO_DIR") or _os.path.abspath("build/pgo")
+if _pgo_phase in ("instrument", "use"):
+    _os.makedirs(_pgo_dir, exist_ok=True)
+
 if sys.platform == "win32":
     # /MT statically links the C and C++ runtimes into the .pyd so end users
-    # do not need any "VC++ redistributable" installed. Python itself already
-    # ships vcruntime140.dll, and once we are static neither msvcp140.dll
-    # nor vcruntime140_1.dll need to be present on the target machine.
-    #
-    # /arch:AVX2 lets the optimizer auto-vectorize where it can. AVX2 has been
-    # standard on Intel since Haswell (2013) and AMD since Excavator (2015);
-    # CPUs older than that don't get accelerated x86_64 wheels but can still
-    # fall back to the sdist build with the flag dropped.
+    # do not need any "VC++ redistributable" installed.
+    # /arch:AVX2 lets the optimizer auto-vectorize where it can (Haswell+).
     extra_compile_args += ["/MT", "/O2", "/EHsc", "/std:c++14"]
     if _is_x86_64:
         extra_compile_args += ["/arch:AVX2"]
-    libraries = ["advapi32"]  # libzpaq uses wincrypt on Windows
+    libraries = ["advapi32"]
+    # MSVC PGO uses /LTCG + /GENPROFILE / /USEPROFILE. Profile file path
+    # is set with PGD= on the link line.
+    _pgd_path = _os.path.join(_pgo_dir, "zpaq.pgd")
+    if _pgo_phase == "instrument":
+        extra_compile_args += ["/GL"]
+        extra_link_args += ["/LTCG:PGI", f"/GENPROFILE:PGD={_pgd_path}"]
+    elif _pgo_phase == "use":
+        extra_compile_args += ["/GL"]
+        extra_link_args += ["/LTCG:PGO", f"/USEPROFILE:PGD={_pgd_path}"]
 else:
     extra_compile_args += ["-O2", "-fvisibility=hidden"]
     if _is_x86_64:
         extra_compile_args += ["-mavx2"]
-    # libzpaq's Windows-vs-unix preprocessor split keys off the `unix` macro.
     define_macros.append(("unix", "1"))
     libraries = []
+    # gcc/clang PGO. Both compilers accept -fprofile-generate / -fprofile-use
+    # with a directory. clang additionally needs llvm-profdata merge between
+    # phases (handled by the workflow), but the compile flags are the same.
+    if _pgo_phase == "instrument":
+        extra_compile_args += [f"-fprofile-generate={_pgo_dir}"]
+        extra_link_args += [f"-fprofile-generate={_pgo_dir}"]
+    elif _pgo_phase == "use":
+        extra_compile_args += [f"-fprofile-use={_pgo_dir}",
+                               "-Wno-missing-profile"]
+        extra_link_args += [f"-fprofile-use={_pgo_dir}"]
 
 
 ext_modules = [
