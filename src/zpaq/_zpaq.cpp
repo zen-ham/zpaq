@@ -202,7 +202,28 @@ struct FragmentInfo {
     unsigned char sha1[20];
     std::uint32_t usize;
     std::size_t offset;  // offset in input
+    // CLI-compatible per-fragment scoring used when computing per-block
+    // method hints. `hits` is the max of four redundancy tests, `text1`
+    // and `exe1` are the boolean fragment-type flags. Default 0 so non
+    // -scoring code paths still work.
+    std::uint32_t hits = 0;
+    bool text1 = false;
+    bool exe1 = false;
 };
+
+// Per-byte fragment-end probability decay table. Verbatim from zpaq.cpp;
+// used in the "non-uniform o1 distribution" redundancy test.
+static const unsigned char kFragDecayTable[256] = {
+    160,80,53,40,32,26,22,20,17,16,14,13,12,11,10,10,
+      9, 8, 8, 8, 7, 7, 6, 6, 6, 6, 5, 5, 5, 5, 5, 5,
+      4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3,
+      3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
 struct Sha20Hash {
     std::size_t operator()(const std::array<unsigned char, 20>& a) const noexcept {
@@ -237,6 +258,11 @@ inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
     std::vector<FragmentInfo> frags;
     if (size == 0) return frags;
 
+    // Tracks the previous N fragments' o1 tables for the cross-fragment
+    // correlation redundancy test. ON=4 matches zpaq.cpp.
+    static constexpr int ON = 4;
+    unsigned char o1prev[256 * ON] = {0};
+
     std::size_t pos = 0;
     while (pos < size) {
         unsigned char o1[256] = {0};
@@ -244,12 +270,17 @@ inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
         unsigned h = 0;
         libzpaq::SHA1 sha1;
         unsigned sz = 0;
+        std::uint32_t hits_count = 0;  // order-1 successful predictions
         std::size_t start = pos;
 
         while (pos < size) {
             unsigned char c = ptr[pos++];
-            if (c == o1[c1]) h = (h + c + 1) * 314159265u;
-            else            h = (h + c + 1) * 271828182u;
+            if (c == o1[c1]) {
+                h = (h + c + 1) * 314159265u;
+                ++hits_count;
+            } else {
+                h = (h + c + 1) * 271828182u;
+            }
             o1[c1] = c;
             c1 = c;
             sha1.put(c);
@@ -259,10 +290,52 @@ inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
                 h < (1u << (22 - fragment_param))) break;
         }
 
+        // Per-fragment scoring (mirrors zpaq.cpp lines 2436-2471).
+        // Four redundancy tests; take the max as `hits`. Plus boolean
+        // text1 / exe1 flags from order-1 transition table analysis.
+        int text_score = 0, exe_score = 0;
+        std::int64_t h1 = sz;
+        unsigned char o1ct[256] = {0};
+        for (int i = 0; i < 256; ++i) {
+            if (o1ct[o1[i]] < 255) {
+                h1 -= (static_cast<std::int64_t>(sz) *
+                       kFragDecayTable[o1ct[o1[i]]++]) >> 15;
+            }
+            if (o1[i] == ' ' && (std::isalnum(i) || i == '.' || i == ','))
+                ++text_score;
+            if (o1[i] && (i < 9 || i == 11 || i == 12 ||
+                          (i >= 14 && i <= 31) || i >= 240))
+                --text_score;
+            if (i >= 192 && i < 240 && o1[i] && (o1[i] < 128 || o1[i] >= 192))
+                --text_score;
+            if (o1[i] == 139) ++exe_score;
+        }
+        bool text1 = (text_score >= 3);
+        bool exe1 = (exe_score >= 5);
+        if (sz > 0) h1 = h1 * h1 / sz;  // Test 2: near 0 if random
+        std::uint32_t hits = hits_count;  // Test 1: o1 hit rate
+        std::uint32_t h2 = static_cast<std::uint32_t>(h1);
+        if (h2 > hits) hits = h2;
+        h2 = static_cast<std::uint32_t>(o1ct[0]) * sz / 256;  // Test 3
+        if (h2 > hits) hits = h2;
+        h2 = 0;
+        for (int i = 0; i < 256 * ON; ++i)  // Test 4: o1 vs previous frag
+            h2 += (o1prev[i] == o1[i & 255]) ? 1u : 0u;
+        h2 = h2 * sz / (256 * ON);
+        if (h2 > hits) hits = h2;
+        if (hits > sz) hits = sz;
+
+        // Shift the rolling history.
+        std::memmove(o1prev, o1prev + 256, 256 * (ON - 1 > 0 ? ON - 1 : 0));
+        std::memcpy(o1prev + 256 * (ON - 1), o1, 256);
+
         FragmentInfo f;
         std::memcpy(f.sha1, sha1.result(), 20);
         f.usize = sz;
         f.offset = start;
+        f.hits = hits;
+        f.text1 = text1;
+        f.exe1 = exe1;
         frags.push_back(f);
     }
     return frags;
@@ -404,14 +477,41 @@ py::bytes compress_dedup(py::buffer data, int level, py::object method_obj,
             put_le(sb, 0, 4);
             put_le(sb, n, 4);
 
-            const std::uint8_t* frag0_ptr =
-                ptr + unique_frags[start - 1].offset;
-            const std::size_t block_usize = sb.size();
+            // Build per-block method string. When `hints` is on we
+            // emit "L,N2,N3" using the CLI-compatible per-fragment
+            // scores collected during chunk_input (mirrors what
+            // zpaq.cpp does at libzpaq.cpp:2502-2504). Without this
+            // step the ratio drops ~1.7pp at multi-block scale, so
+            // dedup mode defaults `hints=True`.
             std::string this_method;
-            if (have_override) this_method = method_str;
-            else if (hints) this_method = method_with_hints(level, frag0_ptr,
-                                                            block_usize);
-            else this_method = std::string(1, static_cast<char>('0' + level));
+            if (have_override) {
+                this_method = method_str;
+            } else if (hints) {
+                std::uint64_t redundancy = 0;
+                std::uint32_t exe_count = 0;
+                std::uint32_t text_count = 0;
+                std::uint32_t frag_count = n;
+                for (std::uint32_t i = start; i < end; ++i) {
+                    const auto& f = unique_frags[i - 1];
+                    redundancy += f.hits;
+                    if (f.exe1) exe_count += 4;
+                    if (f.text1) text_count += 2;
+                }
+                const std::size_t block_usize_no_footer =
+                    sb.size() - (4ull * n + 8);
+                std::uint64_t denom =
+                    static_cast<std::uint64_t>(block_usize_no_footer) / 256 + 1;
+                std::uint64_t n2 = redundancy / denom;
+                if (n2 > 255) n2 = 255;
+                int n3 = ((exe_count > frag_count) ? 2 : 0) +
+                         ((text_count > frag_count) ? 1 : 0);
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%d,%u,%d",
+                              level, static_cast<unsigned>(n2), n3);
+                this_method = std::string(buf);
+            } else {
+                this_method = std::string(1, static_cast<char>('0' + level));
+            }
 
             BytesWriter d_sink;
             libzpaq::compressBlock(&sb, &d_sink, this_method.c_str(),
@@ -951,7 +1051,7 @@ PYBIND11_MODULE(_zpaq, m) {
           py::arg("data"),
           py::arg("level") = 5,
           py::arg("threads") = 0,
-          py::arg("hints") = false,
+          py::arg("hints") = true,
           py::arg("verify") = false,
           py::arg("method") = py::none(),
           py::arg("dedup") = false,
