@@ -28,9 +28,14 @@ SOURCES = [
 extra_compile_args = []
 extra_link_args = []
 # NOJIT toggle. The libzpaq JIT path is x86_64-only and significantly
-# faster on compression levels 3-5. We default to JIT-on for the local
-# build / Windows + Linux x86_64 wheels and only disable it for arm64
-# builds (Apple Silicon, aarch64) where the JIT would emit invalid code.
+# faster on compression levels 3-5. We currently enable it only for
+# Windows x86_64 wheels - that's where it's been verified to work end
+# to end. Linux/manylinux builds segfault inside the JIT-emitted code
+# (likely a libzpaq codegen issue against the manylinux_2_28 toolchain
+# or a W^X restriction inside the build container); macOS would
+# additionally need hardened-runtime carve-outs (MAP_JIT entitlements).
+# Disabling JIT on those platforms means they fall back to the bytecode
+# interpreter for the level 3-5 predictor - correct, just slower.
 import platform as _plat
 _machine = _plat.machine().lower()
 _is_x86_64 = _machine in ("x86_64", "amd64", "x64")
@@ -39,7 +44,8 @@ define_macros = [
     # libdivsufsort-lite that libzpaq vendors. Much faster on levels 3-5.
     ("ZPAQ_USE_LIBSAIS", "1"),
 ]
-if not _is_x86_64:
+_enable_jit = _is_x86_64 and sys.platform == "win32"
+if not _enable_jit:
     define_macros.append(("NOJIT", "1"))
 
 if sys.platform == "win32":
