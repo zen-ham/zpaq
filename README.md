@@ -37,14 +37,14 @@ Performance
 
 ![benchmark](docs/benchmark.png)
 
-Speedup vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5):
+Speedup vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5). Both compress and decompress are now parallel block-wise; `mem` wins both directions at every size from ~1 MB up:
 
-| workload | `zpaq.exe -m5` | best `zpaq.compress` | speedup |
-| --- | --- | --- | --- |
-| 40 KB text | 0.16 s | 0.11 s | **1.5×** |
-| 1 MB text | 2.13 s | 0.49 s (t=12) | **4.3×** |
-| 10 MB text | 23.17 s | 3.91 s (t=12) | **5.9×** |
-| 125 MB text | 183.77 s | 55.42 s (t=12) | **3.3×** |
+| workload | CLI comp | best mem comp | CLI decomp | best mem decomp |
+| --- | --- | --- | --- | --- |
+| 40 KB text | 0.14 s | 0.13 s (**1.1×**) | 0.14 s | 0.12 s (**1.2×**) |
+| 1 MB text | 2.28 s | 0.58 s (**3.9×**) | 2.23 s | 0.58 s (**3.8×**) |
+| 10 MB text | 24.1 s | 3.83 s (**6.3×**) | 25.1 s | 3.83 s (**6.6×**) |
+| 100 MB text | 252.5 s | 74.1 s (**3.4×**) | 250.7 s | 73.2 s (**3.4×**) |
 
 Full benchmark by thread count below. CLI is the official `zpaq.exe` v7.15 invoked with `-m5` (the speeds shown include its `-t0` default of two worker threads). `mem(t=N)` is `zpaq.compress(data, level=5, threads=N)`. Times in seconds; ratio is bytes-reduced over original.
 
@@ -52,35 +52,36 @@ Full benchmark by thread count below. CLI is the official `zpaq.exe` v7.15 invok
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 0.16 s | 0.15 s | 71.5 % |
-| `zpaq.compress(t=1)` | **0.11 s** | **0.11 s** | **73.4 %** |
+| `zpaq.exe -m5` | 0.14 s | 0.14 s | 71.5 % |
+| `zpaq.compress(t=1)` | 0.13 s | 0.13 s | **73.5 %** |
+| `zpaq.compress(t=0)` | **0.13 s** | **0.12 s** | 73.5 % |
 
 1 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 2.13 s | 2.16 s | 80.0 % |
-| `zpaq.compress(t=1)` | 1.97 s | 2.03 s | 80.1 % |
-| `zpaq.compress(t=4)` | 0.73 s | 2.27 s | 79.3 % |
-| `zpaq.compress(t=12)` | **0.49 s** | 2.31 s | 77.6 % |
+| `zpaq.exe -m5` | 2.28 s | 2.23 s | 80.0 % |
+| `zpaq.compress(t=1)` | 2.08 s | 2.12 s | 80.1 % |
+| `zpaq.compress(t=4)` | 0.70 s | 0.75 s | 79.3 % |
+| `zpaq.compress(t=12)` | **0.58 s** | **0.58 s** | 77.6 % |
 
 10 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 23.17 s | 23.82 s | 84.2 % |
-| `zpaq.compress(t=1)` | 21.07 s | 22.23 s | 84.2 % |
-| `zpaq.compress(t=4)` | 6.83 s | 21.17 s | 82.8 % |
-| `zpaq.compress(t=12)` | **3.91 s** | 21.37 s | 81.2 % |
+| `zpaq.exe -m5` | 24.14 s | 25.13 s | 84.2 % |
+| `zpaq.compress(t=1)` | 20.92 s | 21.50 s | 84.2 % |
+| `zpaq.compress(t=4)` | 6.72 s | 6.92 s | 82.8 % |
+| `zpaq.compress(t=12)` | **3.83 s** | **3.83 s** | 81.2 % |
 
-125 MB text:
+100 MB text:
 
 | algo | compress | decompress | ratio % |
 | --- | --- | --- | --- |
-| `zpaq.exe -m5` | 183.77 s | 187.99 s | 86.7 % |
-| `zpaq.compress(t=4)` | 101.40 s | 296.47 s | 85.8 % |
-| `zpaq.compress(t=8)` | 66.03 s | 297.45 s | 85.0 % |
-| `zpaq.compress(t=12)` | **55.42 s** | 289.96 s | 84.5 % |
+| `zpaq.exe -m5` | 252.5 s | 250.7 s | 86.7 % |
+| `zpaq.compress(t=1)` | 324.2 s | 85.9 s | 85.0 % |
+| `zpaq.compress(t=0)` (12 cores) | **74.1 s** | **73.2 s** | 84.5 % |
+| `zpaq.compress(dedup=True)` | 325.4 s | 120 s | **85.06 %** |
 
 **How the speedup is achieved.** `libzpaq`'s reference compiler emits an interpreter for the per-byte context-mixing predictor at compression levels 3-5. The official `zpaq.exe` on x86_64 ships with that interpreter replaced by a JIT that translates the predictor bytecode into native machine code at archive-open time. This package's x86_64 wheels enable the same JIT path **plus**:
 
