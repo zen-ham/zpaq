@@ -3,7 +3,7 @@
 
 [![pypi](https://img.shields.io/pypi/v/zpaq?logo=pypi&color=blue)](https://pypi.org/project/zpaq/) [![Downloads](https://static.pepy.tech/badge/zpaq)](https://pypi.org/project/zpaq/) [![github](https://img.shields.io/badge/GitHub-zpaq-blue?logo=github)](https://github.com/zen-ham/zpaq) [![stars](https://img.shields.io/github/stars/zen-ham/zpaq?style=social)](https://github.com/zen-ham/zpaq)
 
-Pure in-memory ZPAQ compression for Python. I made this because every other zpaq package on PyPI is just a wrapper around the `zpaq` executable — they shell out to the CLI as a subprocess, which means temp files for every operation, fork overhead, and the user needing `zpaq.exe` on their PATH in the first place. None of them are actual bindings. I wanted real bytes->bytes zpaq from Python that just works.
+Pure in-memory ZPAQ compression for Python. I made this because every other zpaq package on PyPI is just a wrapper around the `zpaq` executable, they shell out to the CLI as a subprocess, which means temp files for every operation, fork overhead, and the user needing `zpaq.exe` on their PATH in the first place. None of them are actual bindings. I wanted real bytes->bytes zpaq from Python that just works.
 
 ```py
 import zpaq
@@ -12,19 +12,19 @@ blob = zpaq.compress(b"hello world " * 1_000, level=3)
 assert zpaq.decompress(blob) == b"hello world " * 1_000
 ```
 
-It also ended up alot faster than the official `zpaq.exe` itself — up to **6.6× faster on decompress** and **6.3× faster on compress** at 10 MB, with the same compression ratio. Multi-threaded both directions, JIT-compiled predictor on x86_64, libsais for the suffix-array pass, AVX2 auto-vec compile flag. Default `threads=0` auto-scales across all CPU cores. Pass `threads=1` if you want the absolute best ratio:
+It also ended up alot faster than the official `zpaq.exe` itself, up to **6.6× faster on decompress** and **6.3× faster on compress** at 10 MB, with the same compression ratio. Multi-threaded both directions, JIT-compiled predictor on x86_64, libsais for the suffix-array pass, AVX2 auto-vec compile flag. Default `threads=0` auto-scales across all CPU cores. Pass `threads=1` if you want the absolute best ratio:
 
 ```py
 blob = zpaq.compress(big_data, level=5, threads=1)   # max ratio, single block
 ```
 
-For inputs with repeated content (logs, large text corpora, similar binaries, snapshots), pass `dedup=True` to get fragment-level deduplication — input gets split into ~64 KB content-defined chunks and identical chunks are stored once. Matches what the `zpaq a` CLI produces, so the output is fully `zpaq x` extractable:
+For inputs with repeated content (logs, large text corpora, similar binaries, snapshots), pass `dedup=True` to get fragment-level deduplication, input gets split into ~64 KB content-defined chunks and identical chunks are stored once. Matches what the `zpaq a` CLI produces, so the output is fully `zpaq x` extractable:
 
 ```py
 blob = zpaq.compress(repetitive_data, level=5, dedup=True)   # JIDAC archive
 ```
 
-Prebuilt wheels for Windows / Linux / macOS (including Apple Silicon) across Python 3.9 through 3.13. Installing it never compiles anything. On Windows the wheel statically links the C and C++ runtimes so there's no "Visual C++ Redistributable" requirement — if Python runs, `zpaq` works.
+Prebuilt wheels for Windows / Linux / macOS (including Apple Silicon) across Python 3.9 through 3.13. Installing it never compiles anything. On Windows the wheel statically links the C and C++ runtimes so there's no "Visual C++ Redistributable" requirement, if Python runs, `zpaq` works.
 
 Performance
 ---
@@ -80,10 +80,10 @@ Full breakdown by thread count below. CLI is the official `zpaq.exe` v7.15 invok
 Why this is faster than the official CLI
 ---
 
-`libzpaq`'s reference compiler ships an interpreter for the per-byte context-mixing predictor used at compression levels 3-5. The official `zpaq.exe` on x86_64 ships with that interpreter replaced by a JIT that translates the predictor bytecode into native machine code at archive-open time — that's where most of its speed comes from. This package's x86_64 wheels enable that same JIT path, plus a handful of additions the CLI doesn't have:
+`libzpaq`'s reference compiler ships an interpreter for the per-byte context-mixing predictor used at compression levels 3-5. The official `zpaq.exe` on x86_64 ships with that interpreter replaced by a JIT that translates the predictor bytecode into native machine code at archive-open time, that's where most of its speed comes from. This package's x86_64 wheels enable that same JIT path, plus a handful of additions the CLI doesn't have:
 
 - multi-threaded block compression via `threads=N` (the official CLI tops out at two cores by default)
-- multi-threaded block decompression — I scan the archive for ZPAQ locator-tag block boundaries up front, dispatch each block to a worker, and concatenate. `libzpaq`'s decompress API is sequential, so this layer sits above it.
+- multi-threaded block decompression, I scan the archive for ZPAQ locator-tag block boundaries up front, dispatch each block to a worker, and concatenate. `libzpaq`'s decompress API is sequential, so this layer sits above it.
 - skip-checksum-by-default (`verify=False`); the SHA-1 per block that `zpaq.exe` always computes isn't free, and most "compress these bytes please" workflows don't need it
 - AVX2-enabled compile flags so the optimizer auto-vectorizes where it can (x86_64 wheels assume AVX2; CPUs from 2013+ are covered, anything older falls back to the sdist build)
 - libsais (Apache 2.0) for level-3 BWT suffix-array construction instead of the libdivsufsort-lite that libzpaq ships internally
@@ -162,12 +162,12 @@ For multi-file `zpaq a` archives, `zpaq.decompress` currently returns the concat
 Future work
 ---
 
-Plenty of levers I haven't pulled yet — PRs welcome:
+Plenty of levers I haven't pulled yet, PRs welcome:
 
 - **PGO** (profile-guided optimization). Adding `/GENPROFILE` + `/USEPROFILE` to the MSVC build (and the gcc/clang equivalent) usually adds another 5-15%. Skipped here because cibuildwheel doesn't expose a clean two-stage build hook yet.
 - **Hand-written SIMD in the predictor.** AVX2 is on at the compile flag level so the compiler auto-vectorizes where it can. The actual hot loop is the JIT-emitted predictor, which currently emits one x86 instruction at a time; rewriting the JIT codegen to emit AVX2 mul-add chains for the MIX / ISSE components would be a real gain.
 - **Parallel JIDAC encode.** `dedup=True` is currently single-threaded; splitting the fragment-build pass across cores would speed up large dedup compresses.
-- **Per-segment archive API.** As mentioned above — let callers address individual files inside multi-file `zpaq a` archives by name.
+- **Per-segment archive API.** As mentioned above, let callers address individual files inside multi-file `zpaq a` archives by name.
 
 License
 ---
