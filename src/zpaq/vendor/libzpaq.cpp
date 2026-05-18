@@ -37,6 +37,18 @@ See libzpaq.h for additional documentation.
 #include <wincrypt.h>
 #endif
 
+// zpaqlib patch: optional libsais-backed suffix array construction.
+// When ZPAQ_USE_LIBSAIS is defined, the BWT / LZ77-SA pre-pass calls
+// libsais (Apache 2.0, Ilya Grebnov, see vendor/LICENSE-libsais) instead
+// of the embedded libdivsufsort-lite. libsais is roughly 2-3x faster on
+// large strings. libsais expects int32_t SA entries; libzpaq stores SA in
+// an int* array allocated with ht.size() >= n, so the cast is sound on
+// 32/64-bit platforms (int and int32_t are both 32-bit signed in all the
+// build targets we ship wheels for).
+#ifdef ZPAQ_USE_LIBSAIS
+#include "libsais.h"
+#endif
+
 namespace libzpaq {
 
 // Read 16 bit little-endian number
@@ -6634,7 +6646,17 @@ LZBuffer::LZBuffer(StringBuffer& inbuf, int args[], const unsigned* sap):
       assert(ht.size()>=n);
       assert(ht.size()>0);
       sa=&ht[0];
-      if (n>0) divsufsort((const unsigned char*)in, (int*)sa, n);
+      if (n>0) {
+#ifdef ZPAQ_USE_LIBSAIS
+        // libsais returns 0 on success, negative on error.
+        if (::libsais((const unsigned char*)in, (int32_t*)sa,
+                      (int32_t)n, 0, 0) < 0) {
+          error("libsais failed");
+        }
+#else
+        divsufsort((const unsigned char*)in, (int*)sa, n);
+#endif
+      }
     }
     if (level<3) {
       assert(ht.size()>=(n*(sap==0))+(1u<<17<<args[0]));

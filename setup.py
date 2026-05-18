@@ -17,11 +17,30 @@ SRC = "src/zpaq"
 SOURCES = [
     f"{SRC}/_zpaq.cpp",
     f"{SRC}/vendor/libzpaq.cpp",
+    # libsais (Apache 2.0, Ilya Grebnov) - linear-time suffix array
+    # constructor used at levels 3-5 (BWT / LZ77-SA pre-pass). Several
+    # times faster than the libdivsufsort-lite that libzpaq vendors
+    # internally. Compiled as C (setuptools selects the C compiler by
+    # file extension) so MSVC's _mm_prefetch overload set is happy.
+    f"{SRC}/vendor/libsais.c",
 ]
 
 extra_compile_args = []
 extra_link_args = []
-define_macros = [("NOJIT", "1")]
+# NOJIT toggle. The libzpaq JIT path is x86_64-only and significantly
+# faster on compression levels 3-5. We default to JIT-on for the local
+# build / Windows + Linux x86_64 wheels and only disable it for arm64
+# builds (Apple Silicon, aarch64) where the JIT would emit invalid code.
+import platform as _plat
+_machine = _plat.machine().lower()
+_is_x86_64 = _machine in ("x86_64", "amd64", "x64")
+define_macros = [
+    # Use libsais (Apache 2.0) for suffix-array construction instead of the
+    # libdivsufsort-lite that libzpaq vendors. Much faster on levels 3-5.
+    ("ZPAQ_USE_LIBSAIS", "1"),
+]
+if not _is_x86_64:
+    define_macros.append(("NOJIT", "1"))
 
 if sys.platform == "win32":
     # /MT statically links the C and C++ runtimes into the .pyd so end users
