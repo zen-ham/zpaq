@@ -29,7 +29,7 @@ Prebuilt wheels for Windows / Linux / macOS (including Apple Silicon) across Pyt
 Performance
 ---
 
-![benchmark](docs/benchmark.png)
+![benchmark](https://raw.githubusercontent.com/zen-ham/zpaq/master/docs/benchmark.png)
 
 Benchmarks vs the official `zpaq.exe -m5` (Ryzen-class 12-core x86_64, level 5). The `mem` binding wins both compress and decompress at every size, and `dedup=True` matches or beats the CLI on compression ratio at every scale:
 
