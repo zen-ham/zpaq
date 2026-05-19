@@ -157,7 +157,7 @@ Plenty of levers I haven't pulled yet, PRs welcome:
 
 - **PGO** (profile-guided optimization). Adding `/GENPROFILE` + `/USEPROFILE` to the MSVC build (and the gcc/clang equivalent) usually adds another 5-15%. Skipped here because cibuildwheel doesn't expose a clean two-stage build hook yet.
 - **AVX2 in the JIT predictor.** AVX2 is on at the C++ compile-flag level. The JIT-emitted predictor already uses SSE2 SIMD (`pmaddwd` / `paddd` for the MIX dot-product, lines 4126-4170 in vendored libzpaq.cpp). Upgrading the JIT codegen to AVX2 256-bit ymm registers would handle 16 mixer inputs per iteration instead of 8, but real gain depends heavily on the per-method MIX `m` parameter, and the work is byte-level instruction re-encoding which is fragile. Skipped for now.
-- **Parallel JIDAC encode.** `dedup=True` is currently single-threaded; splitting the fragment-build pass across cores would speed up large dedup compresses.
+- **Smaller-chunk dedup.** The current 64KB content-defined chunk size matches the official CLI for full interop, but smaller chunks (16-32KB) would find more duplicates on similar-but-not-identical files (e.g. log streams, snapshot diffs) at the cost of more index overhead.
 - **Per-segment archive API.** As mentioned above, let callers address individual files inside multi-file `zpaq a` archives by name.
 
 License

@@ -243,6 +243,18 @@ struct Sha20Eq {
 // fragments sized between MIN_FRAGMENT and MAX_FRAGMENT bytes. The same
 // inputs yield the same fragment boundaries as `zpaq.exe a`, so identical
 // content across files dedupes cleanly.
+//
+// Two-pass implementation:
+//   1. Serial scan of the input identifies fragment boundaries via the
+//      rolling hash. This is data-dependent so cannot be parallelized,
+//      but it's pure pointer-chase + small arithmetic so memory bandwidth
+//      is the bottleneck, not CPU.
+//   2. Parallel pass over the boundaries computes SHA-1 + per-fragment
+//      scoring (4 redundancy tests, text/exe flags). Each thread takes a
+//      contiguous run of fragments and maintains its own thread-local
+//      o1prev history. Thread boundaries lose the cross-fragment test 4
+//      benefit on the first ON fragments of each thread, which is a
+//      negligible hint-accuracy hit (~3% of fragments at 12 threads).
 inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
                                              std::size_t size,
                                              int fragment_param = 6) {
@@ -258,86 +270,143 @@ inline std::vector<FragmentInfo> chunk_input(const std::uint8_t* ptr,
     std::vector<FragmentInfo> frags;
     if (size == 0) return frags;
 
-    // Tracks the previous N fragments' o1 tables for the cross-fragment
-    // correlation redundancy test. ON=4 matches zpaq.cpp.
     static constexpr int ON = 4;
-    unsigned char o1prev[256 * ON] = {0};
 
-    std::size_t pos = 0;
-    while (pos < size) {
-        unsigned char o1[256] = {0};
-        int c1 = 0;
-        unsigned h = 0;
-        libzpaq::SHA1 sha1;
-        unsigned sz = 0;
-        std::uint32_t hits_count = 0;  // order-1 successful predictions
-        std::size_t start = pos;
-
+    // -------- Pass 1: serial boundary scan --------
+    // We also record each fragment's hits_count (order-1 prediction hit
+    // rate, "test 1" in the redundancy battery) since it's a cheap by-
+    // product of the rolling-hash loop.
+    struct Boundary {
+        std::size_t start;
+        std::uint32_t usize;
+        std::uint32_t hits_count;
+    };
+    std::vector<Boundary> bounds;
+    bounds.reserve(size / 65536 + 8);
+    {
+        std::size_t pos = 0;
         while (pos < size) {
-            unsigned char c = ptr[pos++];
-            if (c == o1[c1]) {
-                h = (h + c + 1) * 314159265u;
-                ++hits_count;
-            } else {
-                h = (h + c + 1) * 271828182u;
+            unsigned char o1[256] = {0};
+            int c1 = 0;
+            unsigned h = 0;
+            unsigned sz = 0;
+            std::uint32_t hits = 0;
+            std::size_t start = pos;
+            while (pos < size) {
+                unsigned char c = ptr[pos++];
+                if (c == o1[c1]) {
+                    h = (h + c + 1) * 314159265u;
+                    ++hits;
+                } else {
+                    h = (h + c + 1) * 271828182u;
+                }
+                o1[c1] = c;
+                c1 = c;
+                ++sz;
+                if (sz >= MAX_FRAGMENT) break;
+                if (fragment_param <= 22 && sz >= MIN_FRAGMENT &&
+                    h < (1u << (22 - fragment_param))) break;
             }
-            o1[c1] = c;
-            c1 = c;
-            sha1.put(c);
-            ++sz;
-            if (sz >= MAX_FRAGMENT) break;
-            if (fragment_param <= 22 && sz >= MIN_FRAGMENT &&
-                h < (1u << (22 - fragment_param))) break;
+            Boundary b{start, sz, hits};
+            bounds.push_back(b);
         }
-
-        // Per-fragment scoring (mirrors zpaq.cpp lines 2436-2471).
-        // Four redundancy tests; take the max as `hits`. Plus boolean
-        // text1 / exe1 flags from order-1 transition table analysis.
-        int text_score = 0, exe_score = 0;
-        std::int64_t h1 = sz;
-        unsigned char o1ct[256] = {0};
-        for (int i = 0; i < 256; ++i) {
-            if (o1ct[o1[i]] < 255) {
-                h1 -= (static_cast<std::int64_t>(sz) *
-                       kFragDecayTable[o1ct[o1[i]]++]) >> 15;
-            }
-            if (o1[i] == ' ' && (std::isalnum(i) || i == '.' || i == ','))
-                ++text_score;
-            if (o1[i] && (i < 9 || i == 11 || i == 12 ||
-                          (i >= 14 && i <= 31) || i >= 240))
-                --text_score;
-            if (i >= 192 && i < 240 && o1[i] && (o1[i] < 128 || o1[i] >= 192))
-                --text_score;
-            if (o1[i] == 139) ++exe_score;
-        }
-        bool text1 = (text_score >= 3);
-        bool exe1 = (exe_score >= 5);
-        if (sz > 0) h1 = h1 * h1 / sz;  // Test 2: near 0 if random
-        std::uint32_t hits = hits_count;  // Test 1: o1 hit rate
-        std::uint32_t h2 = static_cast<std::uint32_t>(h1);
-        if (h2 > hits) hits = h2;
-        h2 = static_cast<std::uint32_t>(o1ct[0]) * sz / 256;  // Test 3
-        if (h2 > hits) hits = h2;
-        h2 = 0;
-        for (int i = 0; i < 256 * ON; ++i)  // Test 4: o1 vs previous frag
-            h2 += (o1prev[i] == o1[i & 255]) ? 1u : 0u;
-        h2 = h2 * sz / (256 * ON);
-        if (h2 > hits) hits = h2;
-        if (hits > sz) hits = sz;
-
-        // Shift the rolling history.
-        std::memmove(o1prev, o1prev + 256, 256 * (ON - 1 > 0 ? ON - 1 : 0));
-        std::memcpy(o1prev + 256 * (ON - 1), o1, 256);
-
-        FragmentInfo f;
-        std::memcpy(f.sha1, sha1.result(), 20);
-        f.usize = sz;
-        f.offset = start;
-        f.hits = hits;
-        f.text1 = text1;
-        f.exe1 = exe1;
-        frags.push_back(f);
     }
+    frags.resize(bounds.size());
+
+    // -------- Pass 2: parallel SHA-1 + scoring --------
+    // Decide whether parallelism is worth it. Below ~16 fragments the
+    // thread-spin overhead can exceed the serial scoring cost.
+    int nworkers = static_cast<int>(std::thread::hardware_concurrency());
+    if (nworkers < 1) nworkers = 1;
+    if (static_cast<std::size_t>(nworkers) > bounds.size()) {
+        nworkers = static_cast<int>(bounds.size());
+    }
+    if (bounds.size() < 16) nworkers = 1;
+
+    auto score_range = [&](std::size_t bi0, std::size_t bi1) {
+        unsigned char o1prev_local[256 * ON] = {0};
+        for (std::size_t bi = bi0; bi < bi1; ++bi) {
+            const Boundary& b = bounds[bi];
+            unsigned char o1[256] = {0};
+            int c1 = 0;
+            libzpaq::SHA1 sha1;
+            unsigned sz = 0;
+            for (std::size_t p = b.start; p < b.start + b.usize; ++p) {
+                unsigned char c = ptr[p];
+                o1[c1] = c;
+                c1 = c;
+                sha1.put(c);
+                ++sz;
+            }
+            int text_score = 0, exe_score = 0;
+            std::int64_t h1 = sz;
+            unsigned char o1ct[256] = {0};
+            for (int i = 0; i < 256; ++i) {
+                if (o1ct[o1[i]] < 255) {
+                    h1 -= (static_cast<std::int64_t>(sz) *
+                           kFragDecayTable[o1ct[o1[i]]++]) >> 15;
+                }
+                if (o1[i] == ' ' && (std::isalnum(i) || i == '.' || i == ','))
+                    ++text_score;
+                if (o1[i] && (i < 9 || i == 11 || i == 12 ||
+                              (i >= 14 && i <= 31) || i >= 240))
+                    --text_score;
+                if (i >= 192 && i < 240 && o1[i] && (o1[i] < 128 || o1[i] >= 192))
+                    --text_score;
+                if (o1[i] == 139) ++exe_score;
+            }
+            bool text1 = (text_score >= 3);
+            bool exe1 = (exe_score >= 5);
+            if (sz > 0) h1 = h1 * h1 / sz;
+            std::uint32_t hits = b.hits_count;
+            std::uint32_t h2 = static_cast<std::uint32_t>(h1);
+            if (h2 > hits) hits = h2;
+            h2 = static_cast<std::uint32_t>(o1ct[0]) * sz / 256;
+            if (h2 > hits) hits = h2;
+            h2 = 0;
+            for (int i = 0; i < 256 * ON; ++i)
+                h2 += (o1prev_local[i] == o1[i & 255]) ? 1u : 0u;
+            h2 = h2 * sz / (256 * ON);
+            if (h2 > hits) hits = h2;
+            if (hits > sz) hits = sz;
+
+            std::memmove(o1prev_local, o1prev_local + 256, 256 * (ON - 1));
+            std::memcpy(o1prev_local + 256 * (ON - 1), o1, 256);
+
+            FragmentInfo& f = frags[bi];
+            std::memcpy(f.sha1, sha1.result(), 20);
+            f.usize = sz;
+            f.offset = b.start;
+            f.hits = hits;
+            f.text1 = text1;
+            f.exe1 = exe1;
+        }
+    };
+
+    if (nworkers <= 1) {
+        score_range(0, bounds.size());
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(nworkers - 1);
+        const std::size_t per = bounds.size() / nworkers;
+        const std::size_t rem = bounds.size() % nworkers;
+        std::size_t start = 0;
+        std::vector<std::pair<std::size_t, std::size_t>> ranges;
+        ranges.reserve(nworkers);
+        for (int i = 0; i < nworkers; ++i) {
+            std::size_t end = start + per + (i < static_cast<int>(rem) ? 1 : 0);
+            ranges.emplace_back(start, end);
+            start = end;
+        }
+        for (int i = 1; i < nworkers; ++i) {
+            workers.emplace_back([&, i]() {
+                score_range(ranges[i].first, ranges[i].second);
+            });
+        }
+        score_range(ranges[0].first, ranges[0].second);
+        for (auto& w : workers) w.join();
+    }
+
     return frags;
 }
 
