@@ -1,0 +1,59 @@
+# Wheel build for zpaq.
+#
+# Fires on every tag push matching v*. The local updater.py builds the sdist +
+# Windows native wheel and uploads them via twine BEFORE the tag push that
+# triggers this pipeline. This CI's job is to fill in the Linux wheels
+# (cp39-cp313) that the maintainer's Windows machine can't produce. macOS
+# wheels are NOT built here — gitlab.com shared runners are Linux-only on the
+# free tier. If macOS coverage is needed later, add a job using Cirrus CI or
+# self-hosted runners.
+#
+# `skip-existing` on the twine upload keeps it idempotent with the local
+# updater.py upload (which has already pushed sdist + Windows wheel).
+#
+# REQUIRED CI/CD VARIABLE: set PYPI_API_TOKEN at:
+#   gitlab.com/zenham/zpaq/-/settings/ci_cd  ->  Variables -> Add
+#   key: PYPI_API_TOKEN
+#   value: <pypi token, starts with "pypi-...">
+#   flags: Protected (off), Masked (on), Hidden (on)
+
+stages:
+  - build
+  - publish
+
+# Linux wheels via cibuildwheel + docker-in-docker (manylinux containers).
+build_linux_wheels:
+  stage: build
+  image: python:3.12
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+    CIBW_ARCHS_LINUX: "x86_64"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*$/
+    - if: $CI_PIPELINE_SOURCE == "web"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq docker.io >/dev/null
+    - python -m pip install -q --upgrade pip cibuildwheel==2.23.3
+  script:
+    - cibuildwheel --output-dir wheelhouse
+  artifacts:
+    paths:
+      - wheelhouse/*.whl
+    expire_in: 7 days
+
+upload_pypi:
+  stage: publish
+  image: python:3.12
+  needs:
+    - job: build_linux_wheels
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v.*$/
+  before_script:
+    - python -m pip install -q --upgrade pip twine
+  script:
+    - twine upload --skip-existing --non-interactive -u __token__ -p "$PYPI_API_TOKEN" --verbose wheelhouse/*.whl
