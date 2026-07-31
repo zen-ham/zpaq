@@ -1,7 +1,7 @@
 `zpaq`
 ===
 
-[![pypi](https://img.shields.io/pypi/v/zpaq?logo=pypi&color=blue)](https://pypi.org/project/zpaq/) [![Downloads](https://static.pepy.tech/badge/zpaq)](https://pypi.org/project/zpaq/) [![github](https://img.shields.io/badge/GitHub-zpaq-blue?logo=github)](https://gitlab.com/zenham/zpaq) [![stars](https://img.shields.io/gitlab/stars/zenham/zpaq?style=social)](https://gitlab.com/zenham/zpaq)
+[![pypi](https://img.shields.io/pypi/v/zpaq?logo=pypi&color=blue)](https://pypi.org/project/zpaq/) [![Downloads](https://static.pepy.tech/badge/zpaq)](https://pypi.org/project/zpaq/) [![github](https://img.shields.io/badge/GitHub-zpaq-blue?logo=github)](https://github.com/zen-ham/zpaq) [![stars](https://img.shields.io/github/stars/zen-ham/zpaq?style=social)](https://github.com/zen-ham/zpaq)
 
 Pure in-memory ZPAQ compression for Python. I made this because every other zpaq package on PyPI is just a wrapper around the `zpaq` executable, they shell out to the CLI as a subprocess, which means temp files for every operation, fork overhead, and the user needing `zpaq.exe` on their PATH in the first place. None of them are actual bindings. I wanted real bytes->bytes zpaq from Python that just works.
 
